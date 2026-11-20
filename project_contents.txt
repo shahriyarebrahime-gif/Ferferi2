@@ -1,0 +1,1207 @@
+--- README.md ---
+# فرفری — راهنمای راه‌اندازی
+
+سایتی خصوصی با پست (متن، عکس، ویدیو، آهنگ، فایل)، کامنت، واکنش، پروفایل، پیام ناشناس،
+«سخنان نغزِ امروز» و تغییر ظاهر سایت بر اساس حالِ مدیر.
+
+## زبان و ساختار
+- بک‌اند: **Node.js** (نسخه ۱۸ یا بالاتر)، بدون هیچ وابستگی؛ **نیازی به `npm install` نیست**.
+- فرانت‌اند: HTML / CSS / JavaScript داخل پوشه‌ی `public`.
+- داده‌ها داخل پوشه‌ی `data` ذخیره می‌شوند (دیتابیس + فایل‌های آپلودی).
+
+## اجرا روی کامپیوتر (برای تست)
+```
+node server.js
+```
+بعد در مرورگر: http://localhost:3000
+
+## گذاشتن روی هاست
+هاست باید **Node.js** را پشتیبانی کند (VPS، یا هاست‌هایی که «Node.js App» دارند مثل cPanel با گزینه‌ی Setup Node.js App،
+لیارا، Render، Railway و …). هاست‌های فقط-PHP کار نمی‌کنند.
+
+1. کل پوشه را آپلود کن (یا زیپ را روی هاست باز کن).
+2. فایل شروع: `server.js` — دستور اجرا: `npm start` (یا `node server.js`).
+3. متغیرهای محیطی را در پنل هاست تنظیم کن:
+
+| متغیر | معنی | پیش‌فرض |
+|---|---|---|
+| `ADMIN_USER` | نام کاربری مدیر | `Ferferi` |
+| `ADMIN_PASS` | رمز مدیر | `112287878` |
+| `PORT` | پورت (هاست معمولاً خودش می‌گذارد) | `3000` |
+| `DATA_DIR` | مسیر ذخیره‌ی داده‌ها | `./data` |
+| `MAX_UPLOAD_MB` | سقف حجم هر آپلود | `200` |
+| `TZ_NAME` | منطقه‌ی زمانی | `Asia/Tehran` |
+
+**مهم:** پوشه‌ی `data` را هرگز پاک نکن و از آن بکاپ بگیر؛ همه‌ی پست‌ها و کاربران آنجاست.
+اگر هاستت دیسک پایدار ندارد (مثل بعضی پلن‌های رایگان)، `DATA_DIR` را روی یک دیسک دائمی بگذار.
+
+## دامنه‌ی .com
+دامنه را از هر ثبت‌کننده‌ی دامنه بخر، بعد در تنظیمات DNS آن، رکورد `A` را به IP هاست یا
+رکورد `CNAME` را به آدرس هاست بزن. بیشتر هاست‌ها گواهی HTTPS رایگان هم می‌دهند؛ حتماً فعالش کن.
+
+## نصب روی گوشی (مثل اپ)
+- آیفون: Safari ← دکمه‌ی اشتراک‌گذاری ← Add to Home Screen
+- اندروید: منوی مرورگر ← Install app
+(یا از داخل سایت: منو ← «نصب روی گوشی»)
+
+## امنیت
+- رمز کاربران با scrypt هش می‌شود و رمز مدیر فقط در سرور است، نه در کد سایت.
+- فایل‌های آپلودی فقط برای کاربران واردشده قابل دیدن است.
+- بعد از اولین اجرا، `ADMIN_PASS` را عوض کن.
+- پیام‌های ناشناس بدون هیچ اطلاعاتی از فرستنده ذخیره می‌شوند.
+
+## فونت‌ها
+به‌صورت پیش‌فرض از Google Fonts لود می‌شوند. اگر باز نمی‌شود، راهنمای `public/fonts/README.txt` را ببین.
+
+## افزودن جمله‌های عاشقانه
+از داخل سایت: مدیریت ← «جمله‌های من». جمله‌های پیش‌فرض در `content.js` هستند.
+
+--- vercel.json ---
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": null
+}
+
+--- server.js ---
+'use strict';
+/**
+ * سرور سایت فرفری — Node.js خالص، بدون هیچ وابستگی (npm install لازم نیست)
+ * اجرا:  node server.js
+ */
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const zlib = require('zlib');
+const crypto = require('crypto');
+const { MOODS, MQ, QUOTES } = require('./content');
+
+/* ---------- تنظیمات (از متغیرهای محیطی) ---------- */
+const PORT = +process.env.PORT || 3000;
+const DATA = process.env.DATA_DIR || path.join(__dirname, 'data');
+const UPLOADS = path.join(DATA, 'uploads');
+const PUBLIC = path.join(__dirname, 'public');
+const ADMIN_USER = process.env.ADMIN_USER || 'Ferferi';
+const ADMIN_PASS = process.env.ADMIN_PASS || '112287878';
+const TZ = process.env.TZ_NAME || 'Asia/Tehran';
+const MAX_UPLOAD = (+process.env.MAX_UPLOAD_MB || 200) * 1048576;
+const H12 = 12 * 3600e3;
+const REACTIONS = ['❤️', '🌀', '🥹', '😍', '🔥'];
+
+fs.mkdirSync(UPLOADS, { recursive: true });
+
+/* ---------- دیتابیس (فایل JSON با ذخیره‌ی امن) ---------- */
+const DBF = path.join(DATA, 'db.json');
+const db = { users: [], posts: [], comments: [], anon: [], moods: [], lastQuote: {}, customQuotes: [], files: {}, siteMood: 'neutral', ver: 1 };
+try { Object.assign(db, JSON.parse(fs.readFileSync(DBF, 'utf8'))); } catch (e) { /* اولین اجرا */ }
+let saveTimer = null;
+function flush() { clearTimeout(saveTimer); const tmp = DBF + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(db)); fs.renameSync(tmp, DBF); }
+function save() { db.ver++; clearTimeout(saveTimer); saveTimer = setTimeout(flush, 250); }
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { try { flush(); } catch (e) { } process.exit(0); });
+
+/* ---------- ابزارهای امنیتی ---------- */
+const SECRET = (() => {
+  if (process.env.SECRET) return process.env.SECRET;
+  const f = path.join(DATA, 'secret.key');
+  try { return fs.readFileSync(f, 'utf8'); } catch (e) { const s = crypto.randomBytes(32).toString('hex'); fs.writeFileSync(f, s, { mode: 0o600 }); return s; }
+})();
+const sign = s => crypto.createHmac('sha256', SECRET).update(s).digest('base64url');
+const rid = () => crypto.randomBytes(12).toString('hex');
+const hashPw = (pw, salt) => crypto.scryptSync(String(pw), salt, 64).toString('hex');
+const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
+function mkToken(id) { const p = Buffer.from(JSON.stringify({ u: id, e: Date.now() + 60 * 864e5 })).toString('base64url'); return p + '.' + sign(p); }
+function readToken(t) {
+  if (!t) return null; const [p, s] = t.split('.'); if (!p || !s || !safeEq(s, sign(p))) return null;
+  try { const o = JSON.parse(Buffer.from(p, 'base64url').toString()); return o.e > Date.now() ? o.u : null; } catch (e) { return null; }
+}
+const hits = new Map();
+function allow(key, max, ms) { const n = Date.now(); const a = (hits.get(key) || []).filter(t => n - t < ms); if (a.length >= max) { hits.set(key, a); return false; } a.push(n); hits.set(key, a); return true; }
+setInterval(() => { const n = Date.now(); for (const [k, a] of hits) if (!a.length || n - a[a.length - 1] > 36e5) hits.delete(k); }, 6e5).unref();
+
+/* ---------- ساخت حساب مدیر ---------- */
+(function ensureAdmin() {
+  let a = db.users.find(u => u.id === 'admin');
+  if (!a) { a = { id: 'admin', disp: '', bio: '', avatar: null, created: Date.now() }; db.users.push(a); }
+  a.name = ADMIN_USER; a.key = ADMIN_USER.toLowerCase();
+  flush();
+})();
+const RESERVED = () => ['ferferi', 'فرفری', ADMIN_USER.toLowerCase()];
+
+/* ---------- کمکی‌ها ---------- */
+const err = (s, m) => Object.assign(new Error(m), { status: s });
+const json = (res, code, obj) => { if (res.headersSent) return; const b = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(b) }); res.end(b); };
+const need = c => { if (!c.u) throw err(401, 'ابتدا وارد شو.'); return c.u; };
+const adminOnly = c => { const u = need(c); if (u.id !== 'admin') throw err(403, 'این بخش فقط مخصوص مدیر است.'); return u; };
+const byId = id => db.users.find(u => u.id === id);
+const pub = u => u ? { name: u.name, disp: u.disp || '', bio: u.bio || '', avatar: u.avatar ? '/uploads/' + u.avatar : null, admin: u.id === 'admin' } : { name: '؟', disp: 'کاربر حذف‌شده', bio: '', avatar: null, admin: false };
+const clean = (s, n) => String(s == null ? '' : s).replace(/\u0000/g, '').trim().slice(0, n);
+const tkey = () => new Date().toLocaleDateString('en-CA', { timeZone: TZ });
+const dayNum = () => Math.floor(Date.parse(tkey()) / 864e5);
+function readJson(req, max = 200e3) {
+  return new Promise((ok, no) => {
+    let n = 0; const ch = [];
+    req.on('data', c => { n += c.length; if (n > max) { no(err(413, 'حجم درخواست زیاد است.')); req.destroy(); } else ch.push(c); });
+    req.on('end', () => { try { ok(JSON.parse(Buffer.concat(ch).toString() || '{}')); } catch (e) { no(err(400, 'درخواست نامعتبر است.')); } });
+    req.on('error', no);
+  });
+}
+const cookies = req => Object.fromEntries((req.headers.cookie || '').split(';').map(s => s.trim().split('=')).filter(a => a[0]).map(([k, ...v]) => [k, v.join('=')]));
+function setSession(res, req, id) {
+  const secure = req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted;
+  res.setHeader('Set-Cookie', `fs=${id ? mkToken(id) : ''}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${id ? 60 * 86400 : 0}${secure ? '; Secure' : ''}`);
+}
+const ipOf = req => (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '?';
+
+/* ---------- خروجی پست و کامنت ---------- */
+const cOut = (c, forAdmin) => ({ id: c.id, postId: c.postId, user: pub(byId(c.userId)), text: c.text, ts: c.ts, ...(forAdmin ? { seen: !!c.seen } : {}) });
+function postOut(p, me) {
+  const rx = {}; for (const e of Object.values(p.reactions || {})) rx[e] = (rx[e] || 0) + 1;
+  return {
+    id: p.id, text: p.text, ts: p.ts, pinned: !!p.pinned, author: pub(byId('admin')),
+    media: p.media.map(m => ({ ...m, url: '/uploads/' + m.id })),
+    reactions: rx, mine: (p.reactions || {})[me.id] || null,
+    comments: db.comments.filter(c => c.postId === p.id).sort((a, b) => a.ts - b.ts).map(c => cOut(c))
+  };
+}
+function removeFile(id) { if (!id || !db.files[id]) return; delete db.files[id]; fs.unlink(path.join(UPLOADS, id), () => { }); }
+const unseenCounts = () => ({ comments: db.comments.filter(c => !c.seen && c.userId !== 'admin').length, anon: db.anon.filter(a => !a.seen).length });
+
+/* ---------- مسیرها ---------- */
+const routes = [];
+const route = (m, re, fn) => routes.push([m, re, fn]);
+
+// --- ورود و ثبت‌نام
+route('GET', /^\/api\/site$/, () => ({ mood: db.siteMood }));
+route('GET', /^\/api\/me$/, c => ({ user: c.u ? pub(c.u) : null, mood: db.siteMood, ver: db.ver }));
+route('POST', /^\/api\/signup$/, async c => {
+  if (!allow('su:' + c.ip, 10, 36e5)) throw err(429, 'تعداد تلاش‌ها زیاد بود؛ کمی بعد دوباره امتحان کن.');
+  const b = await readJson(c.req), name = clean(b.name, 20), code = clean(b.code, 30);
+  if (!/^[\p{L}\p{N} _.\-]{2,20}$/u.test(name)) throw err(400, 'نام باید ۲ تا ۲۰ حرف باشد.');
+  if (code.length < 3) throw err(400, 'کد ورود باید حداقل ۳ کاراکتر باشد.');
+  if (RESERVED().includes(name.toLowerCase())) throw err(400, 'این نام رزرو شده است؛ نام دیگری انتخاب کن.');
+  if (db.users.some(u => u.key === name.toLowerCase())) throw err(400, 'این نام قبلاً گرفته شده است.');
+  const salt = crypto.randomBytes(16).toString('hex');
+  const u = { id: rid(), name, key: name.toLowerCase(), salt, hash: hashPw(code, salt), disp: '', bio: '', avatar: null, created: Date.now() };
+  db.users.push(u); save(); setSession(c.res, c.req, u.id);
+  return { user: pub(u), mood: db.siteMood };
+});
+route('POST', /^\/api\/login$/, async c => {
+  if (!allow('li:' + c.ip, 15, 6e5)) throw err(429, 'تلاش‌های ناموفق زیاد بود؛ چند دقیقه بعد دوباره امتحان کن.');
+  const b = await readJson(c.req), name = clean(b.name, 20), code = clean(b.code, 30);
+  let u = db.users.find(u => u.key === name.toLowerCase());
+  let ok = false;
+  if (u && u.id === 'admin') ok = safeEq(code, ADMIN_PASS);
+  else if (u) ok = safeEq(hashPw(code, u.salt), u.hash);
+  if (!ok) throw err(401, 'نام یا کد ورود درست نیست.');
+  setSession(c.res, c.req, u.id);
+  return { user: pub(u), mood: db.siteMood };
+});
+route('POST', /^\/api\/logout$/, c => { setSession(c.res, c.req, null); return { ok: true }; });
+
+// --- پروفایل
+route('PUT', /^\/api\/me$/, async c => {
+  const u = need(c), b = await readJson(c.req);
+  const disp = clean(b.disp, 20), bio = clean(b.bio, 160);
+  if (disp && u.id !== 'admin' && RESERVED().includes(disp.toLowerCase())) throw err(400, 'این نام نمایشی رزرو شده است.');
+  if (b.code) {
+    if (u.id === 'admin') throw err(400, 'رمز مدیر از تنظیمات سرور عوض می‌شود.');
+    const code = clean(b.code, 30); if (code.length < 3) throw err(400, 'کد جدید باید حداقل ۳ کاراکتر باشد.');
+    u.salt = crypto.randomBytes(16).toString('hex'); u.hash = hashPw(code, u.salt);
+  }
+  if (b.avatar === null) { removeFile(u.avatar); u.avatar = null; }
+  else if (b.avatar && b.avatar !== u.avatar) {
+    const f = db.files[b.avatar]; if (!f || f.owner !== u.id || f.type !== 'image') throw err(400, 'عکس نامعتبر است.');
+    removeFile(u.avatar); u.avatar = b.avatar;
+  }
+  u.disp = disp; u.bio = bio; save();
+  return { user: pub(u) };
+});
+
+// --- پست‌ها
+route('GET', /^\/api\/posts$/, c => {
+  const u = need(c), q = c.url.searchParams, off = Math.max(0, +q.get('offset') || 0), lim = Math.min(50, +q.get('limit') || 20);
+  const list = [...db.posts].sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.ts - a.ts);
+  return { posts: list.slice(off, off + lim).map(p => postOut(p, u)), total: list.length };
+});
+route('POST', /^\/api\/posts$/, async c => {
+  const u = adminOnly(c), b = await readJson(c.req), text = clean(b.text, 2000);
+  const media = [];
+  for (const m of (Array.isArray(b.media) ? b.media : []).slice(0, 8)) {
+    const f = db.files[m && m.id]; if (!f || f.owner !== u.id || f.used) continue;
+    f.used = true; media.push({ id: m.id, type: f.type, name: f.name, size: f.size });
+  }
+  if (!text && !media.length) throw err(400, 'یک متن یا فایل اضافه کن.');
+  const p = { id: rid(), text, media, ts: Date.now(), pinned: false, reactions: {} };
+  db.posts.push(p); save(); return { post: postOut(p, u) };
+});
+route('DELETE', /^\/api\/posts\/([a-f0-9]+)$/, (c, id) => {
+  adminOnly(c); const p = db.posts.find(p => p.id === id); if (!p) throw err(404, 'پست پیدا نشد.');
+  p.media.forEach(m => removeFile(m.id));
+  db.posts = db.posts.filter(x => x.id !== id); db.comments = db.comments.filter(x => x.postId !== id); save(); return { ok: true };
+});
+route('POST', /^\/api\/posts\/([a-f0-9]+)\/pin$/, (c, id) => {
+  const u = adminOnly(c); const p = db.posts.find(p => p.id === id); if (!p) throw err(404, 'پست پیدا نشد.');
+  p.pinned = !p.pinned; save(); return { post: postOut(p, u) };
+});
+route('POST', /^\/api\/posts\/([a-f0-9]+)\/react$/, async (c, id) => {
+  const u = need(c), b = await readJson(c.req); const p = db.posts.find(p => p.id === id); if (!p) throw err(404, 'پست پیدا نشد.');
+  p.reactions = p.reactions || {};
+  if (!b.emoji || p.reactions[u.id] === b.emoji) delete p.reactions[u.id];
+  else if (REACTIONS.includes(b.emoji)) p.reactions[u.id] = b.emoji; else throw err(400, 'واکنش نامعتبر است.');
+  save(); return { post: postOut(p, u) };
+});
+route('POST', /^\/api\/posts\/([a-f0-9]+)\/comments$/, async (c, id) => {
+  const u = need(c); if (!allow('cm:' + u.id, 20, 6e4)) throw err(429, 'کمی آهسته‌تر.');
+  const b = await readJson(c.req), text = clean(b.text, 500); const p = db.posts.find(p => p.id === id);
+  if (!p) throw err(404, 'پست پیدا نشد.'); if (!text) throw err(400, 'کامنت خالی است.');
+  db.comments.push({ id: rid(), postId: id, userId: u.id, text, ts: Date.now(), seen: u.id === 'admin' }); save();
+  return { post: postOut(p, u) };
+});
+route('DELETE', /^\/api\/comments\/([a-f0-9]+)$/, (c, id) => {
+  const u = need(c); const cm = db.comments.find(x => x.id === id); if (!cm) throw err(404, 'کامنت پیدا نشد.');
+  if (u.id !== 'admin' && cm.userId !== u.id) throw err(403, 'اجازه نداری.');
+  db.comments = db.comments.filter(x => x.id !== id); save();
+  const p = db.posts.find(p => p.id === cm.postId); return { post: p ? postOut(p, u) : null };
+});
+route('GET', /^\/api\/my-comments$/, c => {
+  const u = need(c);
+  return { comments: db.comments.filter(x => x.userId === u.id).sort((a, b) => b.ts - a.ts).map(x => { const p = db.posts.find(p => p.id === x.postId); return { ...cOut(x), snippet: p ? (p.text || 'پست تصویری').slice(0, 40) : 'پست حذف‌شده' }; }) };
+});
+
+// --- پیام ناشناس (فرستنده هرگز ذخیره نمی‌شود)
+route('POST', /^\/api\/anon$/, async c => {
+  const u = need(c); if (!allow('an:' + u.id, 5, 36e5)) throw err(429, 'در هر ساعت حداکثر ۵ پیام می‌توانی بفرستی.');
+  const b = await readJson(c.req), text = clean(b.text, 800); if (text.length < 2) throw err(400, 'یک پیام بنویس.');
+  db.anon.push({ id: rid(), text, ts: Date.now(), seen: false }); save(); return { ok: true };
+});
+
+// --- جمله‌ی عاشقانه (هر ۱۲ ساعت)
+route('GET', /^\/api\/quote$/, c => { const u = need(c), l = db.lastQuote[u.id]; return { last: l || null }; });
+route('POST', /^\/api\/quote$/, c => {
+  const u = need(c), now = Date.now(), l = db.lastQuote[u.id];
+  if (l && now - l.ts < H12) return { quote: l.quote, ts: l.ts, nextAt: l.ts + H12, fresh: false };
+  const pool = QUOTES.concat(db.customQuotes).filter(q => !l || q.text !== l.quote.text);
+  const quote = pool[Math.floor(Math.random() * pool.length)];
+  db.lastQuote[u.id] = { ts: now, quote }; save();
+  return { quote, ts: now, nextAt: now + H12, fresh: true };
+});
+
+// --- بخش مدیر
+route('GET', /^\/api\/ping$/, c => { const u = need(c); return { ver: db.ver, mood: db.siteMood, unseen: u.id === 'admin' ? unseenCounts() : null }; });
+route('GET', /^\/api\/admin\/counts$/, c => { adminOnly(c); return unseenCounts(); });
+route('GET', /^\/api\/admin\/comments$/, c => { adminOnly(c); return { comments: db.comments.filter(x => x.userId !== 'admin').sort((a, b) => b.ts - a.ts).slice(0, 100).map(x => { const p = db.posts.find(p => p.id === x.postId); return { ...cOut(x, true), snippet: p ? (p.text || 'پست تصویری').slice(0, 50) : 'پست حذف‌شده' }; }) }; });
+route('POST', /^\/api\/admin\/seen$/, async c => {
+  adminOnly(c); const b = await readJson(c.req), list = b.kind === 'anon' ? db.anon : db.comments;
+  list.forEach(x => { if (b.all || x.id === b.id) x.seen = true; }); save(); return { ok: true };
+});
+route('GET', /^\/api\/admin\/anon$/, c => { adminOnly(c); return { anon: [...db.anon].sort((a, b) => b.ts - a.ts) }; });
+route('DELETE', /^\/api\/admin\/anon\/([a-f0-9]+)$/, (c, id) => { adminOnly(c); db.anon = db.anon.filter(a => a.id !== id); save(); return { ok: true }; });
+
+route('GET', /^\/api\/admin\/mood$/, c => {
+  adminOnly(c); const base = (dayNum() * 3) % MQ.length;
+  return { done: db.moods.find(m => m.date === tkey()) || null, questions: [0, 1, 2].map(i => MQ[(base + i) % MQ.length]), history: [...db.moods].sort((a, b) => a.date < b.date ? 1 : -1).slice(0, 10) };
+});
+route('POST', /^\/api\/admin\/mood$/, async c => {
+  adminOnly(c); const b = await readJson(c.req), a = b.answers;
+  if (!Array.isArray(a) || a.length !== 3 || a.some(x => !MOODS.includes(x))) throw err(400, 'پاسخ‌ها کامل نیست.');
+  const cnt = {}; a.forEach(x => cnt[x] = (cnt[x] || 0) + 1); const mx = Math.max(...Object.values(cnt));
+  const mood = [...a].reverse().find(x => cnt[x] === mx);
+  db.moods = db.moods.filter(m => m.date !== tkey()); db.moods.push({ date: tkey(), mood, ts: Date.now() }); db.siteMood = mood; save();
+  return { mood };
+});
+
+route('GET', /^\/api\/admin\/quotes$/, c => { adminOnly(c); return { quotes: db.customQuotes }; });
+route('POST', /^\/api\/admin\/quotes$/, async c => {
+  adminOnly(c); const b = await readJson(c.req), text = clean(b.text, 400), cat = ['sad', 'hope', 'love', 'life'].includes(b.cat) ? b.cat : 'love';
+  if (text.length < 5) throw err(400, 'جمله خیلی کوتاه است.');
+  db.customQuotes.push({ id: rid(), cat, text, author: clean(b.author, 40) || 'از دفترِ فرفری' }); save(); return { quotes: db.customQuotes };
+});
+route('DELETE', /^\/api\/admin\/quotes\/([a-f0-9]+)$/, (c, id) => { adminOnly(c); db.customQuotes = db.customQuotes.filter(q => q.id !== id); save(); return { quotes: db.customQuotes }; });
+
+route('GET', /^\/api\/admin\/stats$/, c => {
+  adminOnly(c);
+  return {
+    stats: { users: db.users.length - 1, posts: db.posts.length, comments: db.comments.length, reactions: db.posts.reduce((n, p) => n + Object.keys(p.reactions || {}).length, 0), anon: db.anon.length, files: Object.keys(db.files).length, bytes: Object.values(db.files).reduce((n, f) => n + f.size, 0) },
+    users: db.users.filter(u => u.id !== 'admin').sort((a, b) => b.created - a.created).map(u => ({ id: u.id, name: u.name, disp: u.disp, created: u.created }))
+  };
+});
+route('DELETE', /^\/api\/admin\/users\/([a-f0-9]+)$/, (c, id) => {
+  adminOnly(c); const u = byId(id); if (!u || u.id === 'admin') throw err(404, 'کاربر پیدا نشد.');
+  removeFile(u.avatar); db.users = db.users.filter(x => x.id !== id); db.comments = db.comments.filter(x => x.userId !== id);
+  db.posts.forEach(p => { if (p.reactions) delete p.reactions[id]; }); delete db.lastQuote[id]; save(); return { ok: true };
+});
+
+// --- آپلود (بدنه‌ی خام؛ بدون نیاز به کتابخانه)
+route('POST', /^\/api\/upload$/, c => new Promise((resolve, reject) => {
+  const u = need(c), q = c.url.searchParams, kind = q.get('kind') === 'avatar' ? 'avatar' : 'post';
+  if (kind === 'post') adminOnly(c);
+  if (!allow('up:' + u.id, 60, 36e5)) return reject(err(429, 'آپلود زیاد بود؛ کمی بعد دوباره امتحان کن.'));
+  const limit = kind === 'avatar' ? 4e6 : MAX_UPLOAD;
+  const mime = (c.req.headers['content-type'] || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+  let type = 'file';
+  if (/^image\/(jpeg|png|webp|gif|avif)$/.test(mime)) type = 'image';
+  else if (/^video\/(mp4|quicktime|webm|x-m4v)$/.test(mime)) type = 'video';
+  else if (/^audio\/[a-z0-9.+\-]+$/.test(mime)) type = 'audio';
+  if (kind === 'avatar' && type !== 'image') return reject(err(400, 'فقط عکس مجاز است.'));
+  if (+c.req.headers['content-length'] > limit) return reject(err(413, 'حجم فایل زیاد است.'));
+  let name = clean(q.get('name') || 'file', 120); try { name = clean(decodeURIComponent(name), 120); } catch (e) { }
+  const id = rid(), fp = path.join(UPLOADS, id), ws = fs.createWriteStream(fp); let size = 0, over = false;
+  c.req.on('data', ch => { size += ch.length; if (size > limit && !over) { over = true; c.req.unpipe(ws); ws.destroy(); fs.unlink(fp, () => { }); reject(err(413, 'حجم فایل زیاد است.')); c.req.resume(); } });
+  c.req.pipe(ws);
+  ws.on('finish', () => {
+    if (over) return; if (!size) { fs.unlink(fp, () => { }); return reject(err(400, 'فایل خالی است.')); }
+    db.files[id] = { owner: u.id, type, mime, name, size, used: kind === 'avatar', ts: Date.now() }; save();
+    resolve({ id, type, name, size, url: '/uploads/' + id });
+  });
+  ws.on('error', () => reject(err(500, 'ذخیره‌ی فایل ناموفق بود.')));
+  c.req.on('aborted', () => { ws.destroy(); fs.unlink(fp, () => { }); });
+}));
+
+/* ---------- ارسال فایل با پشتیبانی Range (لازم برای ویدیو و آهنگ در سافاری) ---------- */
+function sendFile(req, res, fp, mime, o = {}) {
+  let st; try { st = fs.statSync(fp); } catch (e) { return json(res, 404, { error: 'پیدا نشد.' }); }
+  const h = { 'Content-Type': mime, 'Accept-Ranges': 'bytes', 'Cache-Control': o.cache || 'private, max-age=86400' };
+  if (o.download) h['Content-Disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(o.name || 'file')}`;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+  if (m && (m[1] || m[2])) {
+    let s = m[1] ? +m[1] : Math.max(0, st.size - +m[2]), e = m[1] && m[2] ? +m[2] : st.size - 1;
+    if (e >= st.size) e = st.size - 1;
+    if (s > e || s >= st.size) { res.writeHead(416, { 'Content-Range': `bytes */${st.size}` }); return res.end(); }
+    h['Content-Range'] = `bytes ${s}-${e}/${st.size}`; h['Content-Length'] = e - s + 1; res.writeHead(206, h);
+    if (req.method === 'HEAD') return res.end();
+    return fs.createReadStream(fp, { start: s, end: e }).on('error', () => res.end()).pipe(res);
+  }
+  h['Content-Length'] = st.size; res.writeHead(200, h);
+  if (req.method === 'HEAD') return res.end();
+  fs.createReadStream(fp).on('error', () => res.end()).pipe(res);
+}
+
+const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf' };
+function serveStatic(req, res, p) {
+  let rel; try { rel = decodeURIComponent(p); } catch (e) { return json(res, 400, { error: 'آدرس نامعتبر' }); }
+  if (rel.endsWith('/')) rel += 'index.html';
+  let f = path.join(PUBLIC, path.normalize(rel));
+  if (!f.startsWith(PUBLIC)) return json(res, 403, { error: 'ممنوع' });
+  let st; try { st = fs.statSync(f); } catch (e) { st = null; }
+  if (!st || st.isDirectory()) { if (path.extname(rel)) return json(res, 404, { error: 'پیدا نشد.' }); f = path.join(PUBLIC, 'index.html'); try { st = fs.statSync(f); } catch (e) { return json(res, 404, { error: 'index.html پیدا نشد.' }); } }
+  const ext = path.extname(f), type = MIME[ext] || 'application/octet-stream', etag = `W/"${st.size}-${Math.round(st.mtimeMs)}"`;
+  if (req.headers['if-none-match'] === etag) { res.writeHead(304); return res.end(); }
+  const long = ['.woff2', '.woff', '.ttf', '.png'].includes(ext);
+  const h = { 'Content-Type': type, ETag: etag, 'Cache-Control': long ? 'public, max-age=604800' : 'no-cache' };
+  if (/text|javascript|json|svg|manifest/.test(type) && /gzip/.test(req.headers['accept-encoding'] || '')) {
+    h['Content-Encoding'] = 'gzip'; h.Vary = 'Accept-Encoding'; res.writeHead(200, h);
+    return req.method === 'HEAD' ? res.end() : fs.createReadStream(f).pipe(zlib.createGzip()).pipe(res);
+  }
+  h['Content-Length'] = st.size; res.writeHead(200, h);
+  if (req.method === 'HEAD') return res.end(); fs.createReadStream(f).pipe(res);
+}
+
+/* ---------- سرور ---------- */
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, 'http://localhost'), p = url.pathname;
+    res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'same-origin'); res.setHeader('X-Frame-Options', 'DENY');
+    const uid = readToken(cookies(req).fs), u = uid ? byId(uid) : null;
+    const ctx = { req, res, url, u: u || null, ip: ipOf(req) };
+
+    if (p === '/healthz') return json(res, 200, { ok: true });
+    if (p.startsWith('/api/')) {
+      for (const [m, re, fn] of routes) {
+        if (m !== req.method) continue; const mm = re.exec(p); if (!mm) continue;
+        const out = await fn(ctx, ...mm.slice(1)); return json(res, 200, out === undefined ? { ok: true } : out);
+      }
+      return json(res, 404, { error: 'مسیر پیدا نشد.' });
+    }
+    if (p.startsWith('/uploads/')) {
+      if (!u) return json(res, 401, { error: 'ابتدا وارد شو.' });
+      const id = p.slice(9), f = db.files[id]; if (!/^[a-f0-9]{24}$/.test(id) || !f) return json(res, 404, { error: 'پیدا نشد.' });
+      const media = f.type === 'image' || f.type === 'video' || f.type === 'audio';
+      return sendFile(req, res, path.join(UPLOADS, id), media ? f.mime : 'application/octet-stream', { download: !media || url.searchParams.has('dl'), name: f.name });
+    }
+    if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'روش نامعتبر' });
+    serveStatic(req, res, p);
+  } catch (e) {
+    if (e && e.status) json(res, e.status, { error: e.message });
+    else { console.error(e); json(res, 500, { error: 'خطای سرور؛ دوباره امتحان کن.' }); }
+  }
+});
+server.requestTimeout = 0; // آپلودهای حجیم
+server.listen(PORT, '0.0.0.0', () => console.log(`فرفری روی پورت ${PORT} بالا آمد  →  http://localhost:${PORT}`));
+
+--- server.ts ---
+require('./server.js');
+
+--- content.js ---
+'use strict';
+// محتوای ثابت: سؤال‌های روان‌شناسی و جمله‌های عاشقانه
+const MOODS = ['happy', 'calm', 'love', 'sad', 'anxious', 'angry'];
+
+const MQ = [
+  { q: 'اگر حال دلت امروز یک آب‌وهوا بود، کدام بود؟', o: [['آفتابِ روشن', 'happy'], ['آسمانِ صاف و ساکت', 'calm'], ['ابری و بارانی', 'sad'], ['طوفانی', 'angry']] },
+  { q: 'الان بیشتر به چه چیزی نیاز داری؟', o: [['یک خنده‌ی بلند', 'happy'], ['یک گوشه‌ی آرام', 'calm'], ['یک گریه‌ی سیرکننده', 'sad'], ['کسی که دلتنگش باشم', 'love']] },
+  { q: 'ذهنت الان شبیه چیست؟', o: [['یک پارکِ آفتابی', 'happy'], ['یک دریاچه‌ی بی‌موج', 'calm'], ['خیابانی شلوغ و پر از بوق', 'anxious'], ['یک اتاق تاریک', 'sad']] },
+  { q: 'سطح انرژی‌ات چقدر است؟', o: [['لبریز', 'happy'], ['متعادل', 'calm'], ['بی‌قرار، مثل سیمِ برق', 'anxious'], ['تقریباً تمام شده', 'sad']] },
+  { q: 'امروز بیشتر دلت می‌خواهد چه کار کنی؟', o: [['برقصم', 'happy'], ['کتاب و چای', 'calm'], ['برای کسی که دوستش دارم پیام بنویسم', 'love'], ['بدوم تا از خشم خالی شوم', 'angry']] },
+  { q: 'خواب دیشبت چطور بود؟', o: [['عمیق و راحت', 'calm'], ['پر از رؤیاهای قشنگ', 'love'], ['بریده‌بریده و پر از دلشوره', 'anxious'], ['اصلاً نخوابیدم / سنگین بود', 'sad']] },
+  { q: 'امروز با خودت چطور حرف می‌زنی؟', o: [['مهربان و تشویق‌کننده', 'happy'], ['ساکت و بی‌قضاوت', 'calm'], ['سخت‌گیر و انتقادی', 'anxious'], ['تند و عصبی', 'angry']] },
+  { q: 'اگر حالت امروز یک آهنگ بود؟', o: [['شاد و ریتمیک', 'happy'], ['ملایم و آرام', 'calm'], ['عاشقانه', 'love'], ['غمگین و کند', 'sad']] },
+  { q: 'دلت برای آدم‌ها چقدر جا دارد؟', o: [['برای همه باز است', 'happy'], ['فقط چند نفر مشخص', 'love'], ['الان نمی‌خواهم کسی را ببینم', 'sad'], ['حوصله‌ی هیچ‌کس را ندارم', 'angry']] },
+  { q: 'اگر امروز یک رنگ بود؟', o: [['زرد و نارنجی', 'happy'], ['آبی‌سبز', 'calm'], ['صورتی و بنفش', 'love'], ['خاکستری', 'sad']] },
+  { q: 'بیشتر چه چیزی توی فکرت است؟', o: [['کارهایی که نمی‌رسم', 'anxious'], ['بی‌عدالتی‌ای که دیدم', 'angry'], ['یک خاطره‌ی قدیمی', 'sad'], ['هیچ، ذهنم راحت است', 'calm']] },
+  { q: 'قلبت امروز چطور می‌زند؟', o: [['تند و هیجان‌زده', 'happy'], ['تند، از استرس', 'anxious'], ['آرام و منظم', 'calm'], ['سنگین و کند', 'sad']] }
+];
+
+// cat: sad=دلتنگی | hope=امید به عشق | love=عاشقانه | life=درسِ عشق
+const QUOTES = [
+  ['sad', 'بشنو از نی چون حکایت می‌کند\nاز جدایی‌ها شکایت می‌کند', 'مولانا'],
+  ['sad', 'دلتنگی یعنی هر جای دنیا که باشی، چیزی از تو هنوز همان‌جاست که او بود.', 'از دفترِ فرفری'],
+  ['sad', 'نبودنش را با هیچ شلوغی‌ای نمی‌شود پر کرد؛ فقط یاد می‌گیری دورِ جای خالی‌اش راه بروی.', 'از دفترِ فرفری'],
+  ['sad', 'بعضی عشق‌ها تمام نمی‌شوند؛ فقط ساکت می‌شوند و ته دل می‌مانند.', 'از دفترِ فرفری'],
+  ['sad', 'تلخ‌ترین دلتنگی، دلتنگیِ کسی‌ست که هنوز همان‌جاست و دیگر مالِ تو نیست.', 'از دفترِ فرفری'],
+  ['sad', 'اگر دلتنگی صدا داشت، شب‌ها از شلوغیِ دلم خوابم نمی‌برد.', 'از دفترِ فرفری'],
+  ['sad', 'گاهی عشق نگه داشتنِ کسی نیست؛ دعا کردن برای خوشبختی‌اش است، حتی وقتی کنارش نیستی.', 'از دفترِ فرفری'],
+  ['hope', 'یوسفِ گم‌گشته باز آید به کنعان غم مخور\nکلبه‌ی احزان شود روزی گلستان غم مخور', 'حافظ'],
+  ['hope', 'عشقِ واقعی دیر می‌آید، اما می‌ماند؛ عجله نکن و دلت را برایش نگه دار.', 'از دفترِ فرفری'],
+  ['hope', 'هر که قرار است بماند، با تمام پیچ‌وتاب‌هایت می‌ماند؛ هیچ فری را صاف نکن.', 'از دفترِ فرفری'],
+  ['hope', 'دلِ شکسته یعنی دلی که جایی برای نورِ بیشتر دارد.', 'از دفترِ فرفری'],
+  ['hope', 'پس از هر دلشکستگی، قلب یاد می‌گیرد عمیق‌تر دوست بدارد.', 'از دفترِ فرفری'],
+  ['hope', 'عشق مثل فر با صبر شکل می‌گیرد و با رها بودن زیبا می‌شود.', 'از دفترِ فرفری'],
+  ['hope', 'یک روز کسی می‌آید که دلتنگیِ این‌همه سال را با یک نگاه جبران کند.', 'از دفترِ فرفری'],
+  ['love', 'عاشق شو ار نه روزی کار جهان سر آید\nناخوانده نقشِ مقصود از کارگاهِ هستی', 'حافظ'],
+  ['love', 'همه عمر برندارم سر از این خمارِ مستی\nکه هنوز من نبودم که تو در دلم نشستی', 'سعدی'],
+  ['love', 'عاشقی پیداست از زاریِ دل\nنیست بیماری چو بیماریِ دل', 'مولانا'],
+  ['love', 'عشق یعنی کسی که موهایت را، هر قدر شلوغ و یاغی، دوست داشته باشد.', 'از دفترِ فرفری'],
+  ['love', 'دوست داشتن یعنی دوباره نگاه کردن به کسی که هزار بار دیده‌ای و باز هم تازه است.', 'از دفترِ فرفری'],
+  ['love', 'بعضی آدم‌ها خانه‌اند؛ نه از جنسِ دیوار، از جنسِ آرامش.', 'از دفترِ فرفری'],
+  ['love', 'عاشقانه‌ترین جمله‌ها همان‌هایی‌اند که بلند گفته نمی‌شوند.', 'از دفترِ فرفری'],
+  ['love', 'با تو حتی سکوت هم حرف‌های زیادی دارد.', 'از دفترِ فرفری'],
+  ['love', 'دوستت دارم یعنی کنارت، همان‌طور که هستم، کافی‌ام.', 'از دفترِ فرفری'],
+  ['love', 'تو را دوست دارم، نه چون به تو نیاز دارم؛ چون با تو بودن بهترین حالتِ من است.', 'از دفترِ فرفری'],
+  ['life', 'دوست آن باشد که گیرد دستِ دوست\nدر پریشان‌حالی و درماندگی', 'سعدی'],
+  ['life', 'عشقِ سالم آرام است؛ دلشوره نمی‌دهد، آرامش می‌دهد.', 'از دفترِ فرفری'],
+  ['life', 'کسی که دوستت دارد، تو را برای دوست داشته شدن به تلاش وادار نمی‌کند.', 'از دفترِ فرفری'],
+  ['life', 'اول خودت را دوست بدار، تا عشق برایت جایگزین نباشد؛ هدیه باشد.', 'از دفترِ فرفری'],
+  ['life', 'عشق یعنی ماندن، وقتی رفتن ساده‌تر است.', 'از دفترِ فرفری'],
+  ['life', 'قدرِ کسی را بدان که در روزهای بد هم دستت را رها نکرد.', 'از دفترِ فرفری'],
+  ['life', 'عشق با «ببخشید» زنده می‌ماند و با غرور می‌میرد.', 'از دفترِ فرفری'],
+  ['life', 'به کسانی که می‌مانند توجه کن، نه به کسانی که قول می‌دهند.', 'از دفترِ فرفری'],
+  ['life', 'هیچ عشقی ارزش ندارد اگر برای داشتنش مجبور شوی خودت را گم کنی.', 'از دفترِ فرفری']
+].map(([cat, text, author]) => ({ cat, text, author }));
+
+module.exports = { MOODS, MQ, QUOTES };
+
+--- package.json ---
+{
+  "name": "ferferi",
+  "version": "1.0.0",
+  "description": "سایت فرفری — شبکه‌ی اجتماعی کوچک و خصوصی",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "license": "UNLICENSED",
+  "private": true
+}
+
+--- sw.js ---
+// Service Worker ساده: سایت روی گوشی مثل اپ نصب می‌شود. (برای آپدیت کش، عدد نسخه را عوض کن)
+const V = 'ferferi-v1', SHELL = ['/', '/style.css', '/app.js', '/icons/icon.svg'];
+self.addEventListener('install', e => { e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
+self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== V).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
+self.addEventListener('fetch', e => {
+  const r = e.request, u = new URL(r.url);
+  if (r.method !== 'GET' || u.origin !== location.origin || u.pathname.startsWith('/api/') || u.pathname.startsWith('/uploads/')) return;
+  e.respondWith(fetch(r).then(res => { const cp = res.clone(); caches.open(V).then(c => c.put(r, cp)); return res; }).catch(() => caches.match(r).then(m => m || caches.match('/'))));
+});
+
+--- index.html ---
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>فرفری</title>
+<meta name="theme-color" content="#17101c">
+<meta name="description" content="فرفری؛ جایی که هر فر یک قصه دارد.">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="فرفری">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Aref+Ruqaa:wght@400;700&family=Vazirmatn:wght@300;400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body data-mood="neutral">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <linearGradient id="cg" x1="0" x2="1"><stop offset="0" stop-color="#e9b872"/><stop offset="1" stop-color="#d46a8a"/></linearGradient>
+  <linearGradient id="cg2" x1="0" x2="1" y1="0" y2="1"><stop offset="0" stop-color="#ffd9a0"/><stop offset="1" stop-color="#ff8fb1"/></linearGradient>
+</defs></svg>
+<canvas id="threads" class="layer"></canvas>
+<canvas id="fx" class="layer"></canvas>
+<canvas id="trail" class="layer"></canvas>
+
+<section id="auth" class="hidden">
+  <div class="auth-wrap">
+    <div class="hero">
+      <h1>فرفری</h1>
+      <svg class="curl" viewBox="0 0 320 56" aria-hidden="true"><path pathLength="1" id="heroPath"/></svg>
+      <p>اینجا هر فر یه قصه داره. اسمت رو بگو و بیا تو.</p>
+    </div>
+    <form class="auth-card glass" id="authForm" autocomplete="off">
+      <div class="seg"><button type="button" class="on" data-act="authTab" data-m="login">ورود</button><button type="button" data-act="authTab" data-m="signup">ساخت حساب</button></div>
+      <label class="field"><span>نام</span><input class="inp" id="aName" maxlength="20" placeholder="مثلاً: سارا" required autocapitalize="off"></label>
+      <label class="field"><span>کد ورود</span><div class="pw"><input class="inp" id="aCode" type="password" maxlength="30" placeholder="یک کد دلخواه" required><button type="button" data-act="eye">نمایش</button></div></label>
+      <p class="err" id="aErr" role="alert"></p>
+      <button class="btn" style="width:100%" id="aBtn">ورود</button>
+      <p class="note" id="aNote">ساخت حساب فقط با یک نام و یک کد ورود انجام می‌شود. کدت را فراموش نکن؛ بازیابی ندارد.</p>
+    </form>
+  </div>
+</section>
+
+<div id="app" class="hidden">
+  <header class="top">
+    <button class="icon-btn" data-act="menu" aria-label="منو" id="menuBtn"></button>
+    <div class="logo">فرفری</div>
+    <span class="chip" id="weather"></span>
+  </header>
+  <main id="view"></main>
+</div>
+<div class="scrim" id="scrim" data-act="menuClose"></div>
+<aside class="drawer" id="drawer" aria-label="منو"></aside>
+<div class="ov" id="ov"></div>
+<div class="toast" id="toast" role="status"></div>
+<script src="/app.js"></script>
+</body>
+</html>
+
+--- manifest.webmanifest ---
+{
+  "name": "فرفری",
+  "short_name": "فرفری",
+  "description": "جایی که هر فر یک قصه دارد.",
+  "lang": "fa",
+  "dir": "rtl",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#17101c",
+  "theme_color": "#17101c",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icons/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
+
+--- style.css ---
+/* فونت‌های محلی (اختیاری): فایل‌ها را در public/fonts بگذار — راهنما در README */
+@font-face{font-family:'VazirLocal';src:url('/fonts/Vazirmatn.woff2') format('woff2');font-display:swap}
+@font-face{font-family:'ArefLocal';src:url('/fonts/ArefRuqaa.woff2') format('woff2');font-display:swap}
+@property --bg1{syntax:'<color>';inherits:true;initial-value:#17101c}
+@property --bg2{syntax:'<color>';inherits:true;initial-value:#2a1a2e}
+@property --ac{syntax:'<color>';inherits:true;initial-value:#e9b872}
+@property --ac2{syntax:'<color>';inherits:true;initial-value:#d46a8a}
+@property --ang{syntax:'<angle>';inherits:false;initial-value:0deg}
+:root{
+  --bg1:#17101c;--bg2:#2a1a2e;--ac:#e9b872;--ac2:#d46a8a;
+  --ink:#f7eff2;--mute:rgba(247,239,242,.68);--glass:rgba(255,255,255,.06);--line:rgba(255,255,255,.14);
+  --r:20px;--head:'ArefLocal','Aref Ruqaa','VazirLocal','Vazirmatn',serif;--body:'VazirLocal','Vazirmatn',Tahoma,sans-serif;
+}
+body[data-mood=happy]{--bg1:#2b1a0e;--bg2:#5a3512;--ac:#ffd166;--ac2:#ff7aa2}
+body[data-mood=calm]{--bg1:#0d1d23;--bg2:#17383f;--ac:#8fe3cf;--ac2:#9ab8ff}
+body[data-mood=sad]{--bg1:#0b111d;--bg2:#1b2740;--ac:#7fa8de;--ac2:#a5b3cc}
+body[data-mood=love]{--bg1:#2a0f1f;--bg2:#531a37;--ac:#ff8fb1;--ac2:#ffd0dc}
+body[data-mood=anxious]{--bg1:#171629;--bg2:#2f2858;--ac:#bba9ff;--ac2:#7de0ff}
+body[data-mood=angry]{--bg1:#1d0b0b;--bg2:#431313;--ac:#ff7a52;--ac2:#ffb347}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;min-height:100dvh;color:var(--ink);font-family:var(--body);line-height:1.8;
+  background:radial-gradient(130% 90% at 85% -10%,var(--bg2),var(--bg1) 62%) fixed;
+  transition:--bg1 1.8s ease,--bg2 1.8s ease,--ac 1.8s ease,--ac2 1.8s ease;overflow-x:hidden}
+body::after{content:"";position:fixed;inset:0;z-index:3;pointer-events:none;opacity:.07;mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+canvas.layer{position:fixed;inset:0;pointer-events:none}
+#threads{z-index:0}#fx{z-index:1}#trail{z-index:70}
+button,input,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--ac);outline-offset:3px}
+.hidden{display:none!important}
+svg.i{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:none}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;cursor:pointer;border-radius:14px;padding:11px 20px;font-weight:500;
+  background:linear-gradient(135deg,var(--ac),var(--ac2));color:#1a0f18;transition:transform .15s,filter .2s}
+.btn:hover{filter:brightness(1.08)}.btn:active{transform:scale(.97)}
+.btn.ghost{background:var(--glass);color:var(--ink);border:1px solid var(--line)}
+.btn.sm{padding:6px 14px;border-radius:11px;font-size:.88rem}
+.btn[disabled]{opacity:.45;pointer-events:none}
+.field{display:block;margin-bottom:14px}
+.field span{display:block;font-size:.88rem;color:var(--mute);margin-bottom:6px}
+.inp{width:100%;background:rgba(0,0,0,.28);border:1px solid var(--line);border-radius:14px;padding:12px 14px;outline:none;transition:border-color .2s,box-shadow .2s;font-size:16px}
+.inp:focus{border-color:var(--ac);box-shadow:0 0 0 3px color-mix(in srgb,var(--ac) 25%,transparent)}
+textarea.inp{resize:vertical;min-height:90px}
+.glass{background:var(--glass);border:1px solid var(--line);border-radius:var(--r);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+
+/* ورود */
+#auth{position:relative;z-index:2;min-height:100dvh;display:grid;place-items:center;padding:24px}
+.auth-wrap{width:min(1000px,100%);display:grid;grid-template-columns:1.1fr .9fr;gap:40px;align-items:center}
+.hero h1{font-family:var(--head);font-size:clamp(4rem,12vw,8rem);line-height:1.1;margin:0;font-weight:700;
+  background:linear-gradient(120deg,var(--ac),var(--ac2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{font-size:1.15rem;color:var(--mute);max-width:30ch;margin:8px 0 0}
+.curl{width:min(320px,80%);height:56px;margin-top:10px;overflow:visible}
+.curl path{fill:none;stroke:url(#cg);stroke-width:3;stroke-linecap:round;stroke-dasharray:1;stroke-dashoffset:1;animation:draw 2.8s .3s cubic-bezier(.6,.1,.2,1) forwards}
+@keyframes draw{to{stroke-dashoffset:0}}
+.auth-card{padding:26px}
+.seg{display:grid;grid-template-columns:1fr 1fr;background:rgba(0,0,0,.28);border-radius:14px;padding:4px;margin-bottom:20px}
+.seg button{border:0;background:none;padding:9px;border-radius:11px;cursor:pointer;color:var(--mute);transition:.25s}
+.seg button.on{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#1a0f18;font-weight:500}
+.pw{position:relative}.pw button{position:absolute;left:8px;top:50%;transform:translateY(-50%);background:none;border:0;color:var(--mute);cursor:pointer;padding:6px;font-size:.82rem}
+.err{color:#ff9aa8;font-size:.9rem;min-height:1.6em;margin:0 0 8px}
+.note{font-size:.82rem;color:var(--mute);margin:14px 0 0}
+
+/* قاب اصلی */
+#app{position:relative;z-index:2}
+.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;padding:10px 16px;padding-top:max(10px,env(safe-area-inset-top));
+  background:color-mix(in srgb,var(--bg1) 72%,transparent);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-bottom:1px solid var(--line)}
+.top .logo{font-family:var(--head);font-size:1.7rem;font-weight:700;background:linear-gradient(120deg,var(--ac),var(--ac2));-webkit-background-clip:text;background-clip:text;color:transparent;flex:1}
+.icon-btn{width:42px;height:42px;border-radius:13px;background:var(--glass);border:1px solid var(--line);display:grid;place-items:center;cursor:pointer;position:relative}
+.chip{font-size:.78rem;padding:4px 12px;border-radius:99px;border:1px solid var(--line);background:var(--glass);color:var(--mute);white-space:nowrap}
+.badge{position:absolute;top:-5px;left:-5px;min-width:19px;height:19px;border-radius:99px;background:var(--ac2);color:#1a0f18;font-size:.7rem;display:grid;place-items:center;padding:0 5px;font-weight:700}
+main{max-width:780px;margin:0 auto;padding:22px 16px calc(90px + env(safe-area-inset-bottom))}
+.view-title{font-family:var(--head);font-size:2rem;margin:6px 0 4px}
+.sub{color:var(--mute);margin:0 0 20px}
+#view.in{animation:vin .45s cubic-bezier(.2,.8,.2,1)}
+@keyframes vin{from{opacity:0;transform:translateY(8px)}}
+
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:40;opacity:0;pointer-events:none;transition:opacity .3s}
+.scrim.on{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;bottom:0;right:0;width:min(330px,86vw);z-index:41;transform:translateX(105%);transition:transform .38s cubic-bezier(.2,.8,.2,1);
+  background:linear-gradient(170deg,var(--bg2),var(--bg1));border-left:1px solid var(--line);padding:20px 16px;padding-top:max(20px,env(safe-area-inset-top));display:flex;flex-direction:column;gap:6px;overflow:auto}
+.drawer.on{transform:none}
+.me{display:flex;align-items:center;gap:12px;padding:6px 6px 18px;border-bottom:1px solid var(--line);margin-bottom:10px;cursor:pointer}
+.me b{display:block}.me small{color:var(--mute)}
+.nav{display:flex;align-items:center;gap:12px;width:100%;text-align:right;background:none;border:0;border-radius:14px;padding:12px 14px;cursor:pointer;color:var(--ink);position:relative;transition:background .2s}
+.nav:hover,.nav.on{background:var(--glass)}
+.nav.on{box-shadow:inset -3px 0 0 var(--ac)}
+.nav .badge{position:static;margin-inline-start:auto}
+.grow{flex:1;min-width:0}
+
+.av{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;font-weight:700;flex:none;background:hsl(var(--h,300) 35% 28%);border:1px solid var(--line);overflow:hidden;cursor:pointer}
+.av.admin{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#1a0f18;border:0}
+.av.s{width:32px;height:32px;font-size:.85rem}
+.av.big{width:96px;height:96px;font-size:2.2rem}
+.av svg{width:60%;height:60%}.av img{width:100%;height:100%;object-fit:cover;display:block}
+
+/* پست‌ها */
+.composer{padding:16px;margin-bottom:22px}
+.att{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.att>div{position:relative;width:76px;height:76px;border-radius:12px;overflow:hidden;border:1px solid var(--line)}
+.att img,.att video{width:100%;height:100%;object-fit:cover}
+.att .ph{display:grid;place-items:center;width:100%;height:100%;background:var(--glass)}
+.att .pg{position:absolute;inset:0;display:grid;place-items:center;background:rgba(0,0,0,.6);font-size:.82rem}
+.att button{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;border:0;background:rgba(0,0,0,.65);color:#fff;cursor:pointer;display:grid;place-items:center;padding:0}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.post{padding:18px;margin-bottom:20px}
+.post.pin{border-color:color-mix(in srgb,var(--ac) 55%,transparent)}
+.post-h{display:flex;gap:12px;align-items:center;margin-bottom:12px}
+.post-h b{display:block;line-height:1.3}.post-h small{color:var(--mute)}
+.pinned{font-size:.74rem;color:var(--ac);margin-inline-start:8px}
+.post-t{white-space:pre-wrap;word-break:break-word;margin:0 0 12px;font-size:1.04rem}
+.media{display:grid;gap:6px;margin:0 0 12px}.media.m2,.media.m3,.media.m4{grid-template-columns:1fr 1fr}
+.media img,.media video{width:100%;border-radius:14px;max-height:520px;object-fit:cover;background:#000;display:block;cursor:zoom-in}
+.media video{cursor:auto}
+.media.m1 img,.media.m1 video{object-fit:contain}
+.aud{display:flex;flex-direction:column;gap:8px;padding:12px 14px;margin:0 0 12px;border-radius:16px;background:linear-gradient(135deg,color-mix(in srgb,var(--ac) 16%,transparent),color-mix(in srgb,var(--ac2) 14%,transparent));border:1px solid var(--line)}
+.aud-h{display:flex;gap:10px;align-items:center;font-weight:500;min-width:0}
+.aud-h span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.aud audio{width:100%;height:40px}
+.fcard{display:flex;gap:12px;align-items:center;padding:12px 14px;margin:0 0 12px;border-radius:16px;background:var(--glass);border:1px solid var(--line);color:var(--ink);text-decoration:none}
+.fcard .grow{overflow:hidden;text-overflow:ellipsis}.fcard small{display:block;color:var(--mute)}
+.rxs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}
+.rx{display:flex;gap:5px;align-items:center;border:1px solid var(--line);background:var(--glass);border-radius:99px;padding:2px 10px;font-size:.9rem;cursor:pointer}
+.rx.me{border-color:var(--ac);background:color-mix(in srgb,var(--ac) 18%,transparent)}
+.acts{display:flex;gap:8px;border-top:1px solid var(--line);padding-top:10px;position:relative}
+.act{display:flex;align-items:center;gap:7px;background:none;border:0;color:var(--mute);cursor:pointer;padding:6px 10px;border-radius:11px;transition:.2s}
+.act:hover{background:var(--glass);color:var(--ink)}
+.tray{position:absolute;bottom:52px;right:0;display:none;gap:4px;padding:6px 10px;border-radius:99px;background:color-mix(in srgb,var(--bg2) 92%,#000);border:1px solid var(--line);box-shadow:0 10px 30px rgba(0,0,0,.4);z-index:5}
+.tray.on{display:flex;animation:pop .25s cubic-bezier(.2,1.4,.4,1)}
+@keyframes pop{from{transform:scale(.6);opacity:0}}
+.tray button{background:none;border:0;font-size:1.5rem;cursor:pointer;padding:2px 6px;border-radius:50%;transition:transform .15s}
+.tray button:hover{transform:scale(1.35) translateY(-3px)}
+.cm{margin-top:10px;display:grid;gap:10px}
+.cmi{display:flex;gap:10px;align-items:flex-start}
+.cmb{background:rgba(0,0,0,.25);border-radius:16px;border-top-right-radius:4px;padding:8px 14px;flex:1;min-width:0}
+.cmb b{font-size:.88rem}.cmb small{color:var(--mute);margin-inline-start:6px}
+.cmb p{margin:0;word-break:break-word;white-space:pre-wrap}
+.xbtn{background:none;border:0;color:var(--mute);cursor:pointer;padding:2px}
+.xbtn:hover{color:#ff9aa8}
+.cform{display:flex;gap:8px;margin-top:4px}
+.cform .inp{padding:9px 14px;border-radius:99px}
+.cform .btn{border-radius:99px;padding:8px 14px}
+.empty{text-align:center;padding:40px 20px;color:var(--mute)}
+.empty svg{width:48px;height:48px;opacity:.6;margin-bottom:8px}
+.sk{height:150px;border-radius:var(--r);margin-bottom:20px;background:linear-gradient(100deg,var(--glass) 30%,rgba(255,255,255,.12) 50%,var(--glass) 70%);background-size:300% 100%;animation:sk 1.4s infinite linear;border:1px solid var(--line)}
+@keyframes sk{from{background-position:100% 0}to{background-position:-100% 0}}
+
+/* مدیریت */
+.tabs{display:flex;gap:6px;margin-bottom:18px;overflow:auto;padding-bottom:4px}
+.tabs button{flex:none;border:1px solid var(--line);background:var(--glass);border-radius:99px;padding:8px 16px;cursor:pointer;display:flex;gap:8px;align-items:center}
+.tabs button.on{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#1a0f18;border-color:transparent;font-weight:500}
+.tabs .n{background:var(--ac2);color:#1a0f18;border-radius:99px;font-size:.72rem;min-width:19px;text-align:center;padding:0 5px;font-weight:700}
+.tabs .on .n{background:#1a0f18;color:var(--ac)}
+.item{padding:14px 16px;margin-bottom:12px;display:flex;gap:12px}
+.item.new{border-color:color-mix(in srgb,var(--ac) 60%,transparent)}
+.item p{margin:2px 0 6px;white-space:pre-wrap;word-break:break-word}
+.item small{color:var(--mute)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:18px}
+.stat{padding:16px;text-align:center}.stat b{display:block;font-family:var(--head);font-size:2rem;line-height:1.3;color:var(--ac)}.stat small{color:var(--mute)}
+.mood-card{padding:24px;text-align:center}
+.mq{font-family:var(--head);font-size:1.7rem;margin:6px 0 18px;line-height:1.7}
+.opts{display:grid;gap:10px}
+.opt{border:1px solid var(--line);background:var(--glass);border-radius:16px;padding:14px 16px;cursor:pointer;text-align:right;transition:.2s}
+.opt:hover{border-color:var(--ac);transform:translateX(-4px)}
+.dots{display:flex;gap:6px;justify-content:center;margin-bottom:6px}
+.dots i{width:28px;height:4px;border-radius:9px;background:var(--line)}.dots i.on{background:var(--ac)}
+.hist{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:18px}
+
+/* سخنان نغز */
+.q-stage{position:relative;text-align:center;padding:44px 22px;overflow:hidden}
+.q-ring{width:150px;height:150px;margin:0 auto 14px;display:block}
+.q-ring path{fill:none;stroke:url(#cg2);stroke-width:2.6;stroke-linecap:round}
+.q-ring g{transform-origin:75px 75px;animation:spin 18s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.q-cta{font-size:1.05rem;padding:14px 28px}
+.last{margin-top:26px;padding:18px;text-align:right}
+.last small{color:var(--mute)}
+.last p{font-family:var(--head);font-size:1.25rem;margin:6px 0;white-space:pre-line}
+.ov{position:fixed;inset:0;z-index:60;display:grid;place-items:center;padding:20px;background:radial-gradient(circle at 50% 40%,rgba(0,0,0,.55),rgba(0,0,0,.92));opacity:0;pointer-events:none;transition:opacity .5s;overflow:auto}
+.ov.on{opacity:1;pointer-events:auto}
+.dlg{width:min(440px,100%);padding:26px;text-align:center;transform:translateY(20px) scale(.96);transition:transform .45s cubic-bezier(.2,.9,.3,1.2);background:linear-gradient(160deg,var(--bg2),var(--bg1));border:1px solid var(--line);border-radius:24px}
+.ov.on .dlg{transform:none}
+.dlg h3{font-family:var(--head);font-size:1.8rem;margin:0 0 8px;line-height:1.6}
+.dlg p{color:var(--mute);margin:0 0 20px}
+.dlg ol{text-align:right;color:var(--mute);padding-inline-start:20px;margin:0 0 18px}
+.qcard{--qc:var(--ac);position:relative;width:min(560px,100%);border-radius:30px;padding:3px;
+  background:conic-gradient(from var(--ang),var(--qc),transparent 22%,var(--ac2) 45%,transparent 68%,var(--qc));animation:rot 5s linear infinite;
+  box-shadow:0 0 90px -10px var(--qc);transform:scale(.8) rotate(-2deg);opacity:0;transition:transform .9s cubic-bezier(.2,.9,.2,1.1),opacity .9s}
+.ov.on .qcard{transform:none;opacity:1}
+@keyframes rot{to{--ang:360deg}}
+.qin{position:relative;border-radius:27px;padding:44px 28px 26px;text-align:center;background:linear-gradient(170deg,color-mix(in srgb,var(--bg2) 88%,#000),#0a0610);overflow:hidden}
+.qin::before{content:"”";position:absolute;top:-30px;right:12px;font-family:var(--head);font-size:12rem;line-height:1;color:var(--qc);opacity:.13}
+.qcat{display:inline-block;padding:3px 16px;border-radius:99px;font-size:.85rem;background:color-mix(in srgb,var(--qc) 22%,transparent);color:var(--qc);border:1px solid color-mix(in srgb,var(--qc) 55%,transparent);margin-bottom:20px}
+.qtext{font-family:var(--head);font-size:clamp(1.5rem,5.2vw,2.15rem);line-height:2.1;margin:0 0 16px;position:relative}
+.qtext span{display:inline-block;opacity:0;filter:blur(8px);transform:translateY(10px);animation:wd .9s forwards}
+@keyframes wd{to{opacity:1;filter:none;transform:none}}
+.qauth{color:var(--mute);font-size:.95rem;margin-bottom:18px}
+.qauth::before{content:"";display:block;width:60px;height:2px;margin:0 auto 12px;background:linear-gradient(90deg,transparent,var(--qc),transparent)}
+.qnext{font-size:.82rem;color:var(--mute);margin-top:12px}
+.zoom img{max-width:94vw;max-height:88vh;border-radius:14px}
+
+.toast{position:fixed;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;transform:translate(-50%,30px);background:var(--ink);color:#1a0f18;padding:10px 20px;border-radius:99px;z-index:90;opacity:0;transition:.35s;font-weight:500;max-width:90vw;text-align:center;pointer-events:none}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+.paper{animation:fly 1.2s cubic-bezier(.5,0,.8,.4) forwards}
+@keyframes fly{0%{transform:none;opacity:1}100%{transform:translate(-160px,-220px) rotate(-30deg) scale(.4);opacity:0}}
+
+@media(max-width:820px){.auth-wrap{grid-template-columns:1fr;gap:22px;text-align:center}.hero p,.curl{margin-inline:auto}}
+@media(prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+
+--- app.js ---
+'use strict';
+/* ============ ابزارها ============ */
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fa = n => Number(n).toLocaleString('fa-IR');
+const IC = {
+  menu: '<path d="M4 6h16M4 12h16M4 18h16"/>', home: '<path d="M3 11l9-8 9 8M5 10v10h14V10"/>',
+  chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/>', mail: '<path d="M3 6h18v12H3zM3 7l9 6 9-6"/>',
+  spark: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 16l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"/>',
+  shield: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>', out: '<path d="M15 4h4v16h-4M10 8l4 4-4 4M14 12H5"/>',
+  heart: '<path d="M12 20s-7-4.5-7-10a4 4 0 0 1 7-2.5A4 4 0 0 1 19 10c0 5.5-7 10-7 10z"/>', send: '<path d="M4 12l16-8-6 16-3-7z"/>',
+  trash: '<path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13"/>', img: '<path d="M4 5h16v14H4zM4 16l5-5 4 4 3-3 4 4"/><circle cx="9" cy="9" r="1.3"/>',
+  x: '<path d="M6 6l12 12M18 6L6 18"/>', copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/>',
+  music: '<path d="M9 18V5l11-2v13"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="16" r="2.5"/>',
+  file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5"/>', down: '<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4-6 8-6s7 2 8 6"/>', pin: '<path d="M9 4h6l-1 6 3 3H7l3-3zM12 13v8"/>',
+  phone: '<rect x="7" y="2" width="10" height="20" rx="2.5"/><path d="M11 18h2"/>', smile: '<circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9.5h.01M15 9.5h.01"/>'
+};
+const ico = (n, c = '') => `<svg class="i ${c}" viewBox="0 0 24 24" aria-hidden="true">${IC[n]}</svg>`;
+function ago(ts) { const s = (Date.now() - ts) / 1000; if (s < 60) return 'همین الان'; if (s < 3600) return fa(Math.floor(s / 60)) + ' دقیقه پیش'; if (s < 86400) return fa(Math.floor(s / 3600)) + ' ساعت پیش'; if (s < 604800) return fa(Math.floor(s / 86400)) + ' روز پیش'; return new Date(ts).toLocaleDateString('fa-IR'); }
+function toast(t) { const e = $('#toast'); e.textContent = t; e.classList.add('on'); clearTimeout(toast.t); toast.t = setTimeout(() => e.classList.remove('on'), 2800); }
+function curlD(len, loops, R, h) { const st = loops * 30; let d = ''; for (let i = 0; i <= st; i++) { const t = i / st * loops * 6.2832; const x = R + (len - 2 * R) * i / st - R * Math.sin(t), y = h / 2 - R * Math.cos(t) * .9; d += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + y.toFixed(1); } return d; }
+const fsize = b => b >= 1048576 ? fa((b / 1048576).toFixed(1)) + ' مگابایت' : fa(Math.max(1, Math.round(b / 1024))) + ' کیلوبایت';
+const RM = matchMedia('(prefers-reduced-motion:reduce)').matches;
+
+/* ============ ارتباط با سرور ============ */
+let me = null, mood = 'neutral', ver = 0, unseenN = 0, view = 'home';
+const U = {}; const ingest = u => { if (u) U[u.name] = u; return u; };
+const dname = u => (u && (u.disp || (u.admin ? 'فرفری' : u.name))) || '؟';
+async function api(path, method = 'GET', body) {
+  let r; try { r = await fetch('/api' + path, { method, headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined, body: body !== undefined ? JSON.stringify(body) : undefined, credentials: 'same-origin' }); }
+  catch (e) { throw new Error('ارتباط با سرور برقرار نشد؛ اینترنتت را بررسی کن.'); }
+  let d = null; try { d = await r.json(); } catch (e) { }
+  if (!r.ok) { const e = new Error((d && d.error) || 'خطایی رخ داد.'); e.status = r.status; if (r.status === 401 && me && path !== '/login') { me = null; showAuth(); } throw e; }
+  return d;
+}
+function upload(file, name, kind, onp) {
+  return new Promise((ok, no) => {
+    const x = new XMLHttpRequest(); x.open('POST', '/api/upload?kind=' + kind + '&name=' + encodeURIComponent(name || file.name || 'file'));
+    x.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+    x.upload.onprogress = e => e.lengthComputable && onp && onp(e.loaded / e.total);
+    x.onload = () => { let d = {}; try { d = JSON.parse(x.responseText); } catch (e) { } x.status === 200 ? ok(d) : no(new Error(d.error || 'آپلود ناموفق بود.')); };
+    x.onerror = () => no(new Error('اتصال قطع شد.')); x.send(file);
+  });
+}
+
+/* ============ پس‌زمینه: نخ‌های فرفری ============ */
+const cv = $('#threads'), cx = cv.getContext('2d'), fxc = $('#fx'), fx = fxc.getContext('2d');
+let W, H, D, strands = [], T = 0, parts = [], fxType = 'neutral';
+let thCol = [233, 184, 114], thTarget = [233, 184, 114], thCol2 = [212, 106, 138], thTarget2 = [212, 106, 138];
+const R = (a, b) => a + Math.random() * (b - a);
+function rgb(h) { h = h.trim().replace('#', ''); if (h.length === 3) h = h.split('').map(x => x + x).join(''); return [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16)); }
+function syncColors() { const s = getComputedStyle(document.body); try { thTarget = rgb(s.getPropertyValue('--ac') || '#e9b872'); thTarget2 = rgb(s.getPropertyValue('--ac2') || '#d46a8a'); } catch (e) { } }
+function sizeCanvas(c) { c.width = innerWidth * D; c.height = innerHeight * D; c.style.width = innerWidth + 'px'; c.style.height = innerHeight + 'px'; }
+function build() {
+  D = Math.min(2, devicePixelRatio || 1); [cv, fxc, trail].forEach(sizeCanvas); W = cv.width; H = cv.height;
+  const n = innerWidth < 640 ? 5 : 9; strands = [];
+  for (let i = 0; i < n; i++) strands.push({ x: (i + .5) / n * W + (Math.random() - .5) * 60 * D, R: (16 + Math.random() * 20) * D, p: (5 + Math.random() * 4) * D, ph: Math.random() * 6.28, sp: (.2 + Math.random() * .25) * (i % 2 ? 1 : -1), w: (1.1 + Math.random() * 1.3) * D, a: .12 + Math.random() * .2, k: i % 2 });
+}
+function drawThreads() {
+  cx.clearRect(0, 0, W, H);
+  for (let i = 0; i < 3; i++) { thCol[i] += (thTarget[i] - thCol[i]) * .03; thCol2[i] += (thTarget2[i] - thCol2[i]) * .03; }
+  strands.forEach(s => {
+    const c = s.k ? thCol2 : thCol, S = (H + s.R * 3) / s.p; cx.beginPath();
+    for (let t = 0; t <= S; t += .14) { const th = t + s.ph + T * s.sp, y = t * s.p - s.R, sway = 26 * D * Math.sin(y * .004 / D + T * .25 + s.ph); const x = s.x + sway + s.R * Math.cos(th), yy = y + s.R * Math.sin(th); t ? cx.lineTo(x, yy) : cx.moveTo(x, yy); }
+    cx.strokeStyle = `rgba(${c.map(Math.round)},${s.a})`; cx.lineWidth = s.w; cx.lineCap = 'round'; cx.stroke();
+    cx.strokeStyle = `rgba(255,255,255,${s.a * .35})`; cx.lineWidth = s.w * .35; cx.stroke();
+  });
+}
+function mk(init) {
+  const t = fxType, x = R(0, W), y = init ? R(0, H) : null;
+  switch (t) {
+    case 'sad': return { x, y: init ? y : -30, vy: R(14, 24) * D, vx: -3 * D, l: R(12, 26) * D, a: R(.18, .45) };
+    case 'happy': return { x, y: init ? y : H + 10, vy: -R(.4, 1.4) * D, r: R(1, 3.4) * D, a: R(.3, .9), ph: R(0, 6) };
+    case 'calm': return { x, y: y ?? R(0, H), r: R(14, 30) * D, ph: R(0, 6), a: R(.12, .3) };
+    case 'love': return { x, y: init ? y : H + 30, vy: -R(.5, 1.5) * D, s: R(7, 17) * D, a: R(.25, .6), ph: R(0, 6), rot: R(-.4, .4) };
+    case 'anxious': return { x: init ? x : W + 40, y: R(0, H), vx: -R(18, 34) * D, l: R(40, 120) * D, a: R(.08, .25) };
+    case 'angry': return { x, y: init ? y : H + 10, vy: -R(1.5, 4) * D, r: R(1, 3) * D, a: R(.4, 1), ph: R(0, 6) };
+    default: return { x, y: init ? y : H + 10, vy: -R(.15, .5) * D, r: R(.8, 2) * D, a: R(.15, .45), ph: R(0, 6) };
+  }
+}
+function setFx(t) { fxType = t; const n = { sad: Math.round(innerWidth / 5), happy: 60, calm: 26, love: 34, anxious: 22, angry: 70, neutral: 45 }[t] || 40; parts = Array.from({ length: n }, () => mk(true)); }
+function heart(c, x, y, s) { c.beginPath(); c.moveTo(x, y + s * .35); c.bezierCurveTo(x - s, y - s * .3, x - s * .6, y - s, x, y - s * .45); c.bezierCurveTo(x + s * .6, y - s, x + s, y - s * .3, x, y + s * .35); c.fill(); }
+function drawFx() {
+  fx.clearRect(0, 0, W, H); const c1 = thCol.map(Math.round), c2 = thCol2.map(Math.round);
+  parts.forEach((p, i) => {
+    const t = fxType;
+    if (t === 'sad') { p.x += p.vx; p.y += p.vy; fx.strokeStyle = `rgba(170,200,255,${p.a})`; fx.lineWidth = 1.2 * D; fx.beginPath(); fx.moveTo(p.x, p.y); fx.lineTo(p.x + p.vx * .5, p.y - p.l); fx.stroke(); if (p.y > H + 20) { parts[i] = mk(false); parts[i].x = R(0, W + 200); } }
+    else if (t === 'happy' || t === 'neutral' || t === 'angry') { p.y += p.vy; p.x += Math.sin(T * (t === 'angry' ? 3 : 1) + p.ph) * .5 * D; const tw = t === 'happy' ? .5 + .5 * Math.sin(T * 3 + p.ph) : 1; fx.fillStyle = t === 'angry' ? `rgba(255,${Math.round(R(90, 170))},50,${p.a * tw})` : `rgba(${c1},${p.a * tw})`; fx.beginPath(); fx.arc(p.x, p.y, p.r, 0, 6.3); fx.fill(); if (p.y < -20) parts[i] = mk(false); }
+    else if (t === 'calm') { p.x += Math.sin(T * .3 + p.ph) * .4 * D; p.y += Math.cos(T * .25 + p.ph) * .3 * D; const al = p.a * (.5 + .5 * Math.sin(T * .8 + p.ph)); const g = fx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r); g.addColorStop(0, `rgba(${c1},${al})`); g.addColorStop(1, `rgba(${c1},0)`); fx.fillStyle = g; fx.beginPath(); fx.arc(p.x, p.y, p.r, 0, 6.3); fx.fill(); }
+    else if (t === 'love') { p.y += p.vy; p.x += Math.sin(T * 1.2 + p.ph) * .8 * D; fx.fillStyle = `rgba(${i % 2 ? c1 : c2},${p.a})`; fx.save(); fx.translate(p.x, p.y); fx.rotate(p.rot + Math.sin(T + p.ph) * .3); heart(fx, 0, 0, p.s); fx.restore(); if (p.y < -30) parts[i] = mk(false); }
+    else if (t === 'anxious') { p.x += p.vx; fx.strokeStyle = `rgba(${c1},${p.a})`; fx.lineWidth = 1.2 * D; fx.beginPath(); fx.moveTo(p.x, p.y + Math.sin(T * 4 + i) * 3); fx.lineTo(p.x + p.l, p.y); fx.stroke(); if (p.x < -p.l) parts[i] = mk(false); }
+  });
+}
+/* دنباله‌ی فرفریِ موس (فقط دسکتاپ) */
+const trail = $('#trail'), tx = trail.getContext('2d'); let pts = [];
+const fine = matchMedia('(pointer:fine)').matches;
+if (fine && !RM) addEventListener('pointermove', e => { pts.push({ x: e.clientX * D, y: e.clientY * D, t: performance.now() }); if (pts.length > 60) pts.shift(); }, { passive: true });
+function drawTrail(now) {
+  tx.clearRect(0, 0, W, H); pts = pts.filter(p => now - p.t < 700); if (pts.length < 3) return;
+  const c = thCol.map(Math.round); tx.lineCap = 'round';
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i], age = (now - b.t) / 700, r = (14 * (1 - age)) * D, th = i * .9;
+    tx.strokeStyle = `rgba(${c},${(1 - age) * .75})`; tx.lineWidth = (3.2 * (1 - age) + .6) * D;
+    tx.beginPath(); tx.moveTo(a.x + Math.cos(th - .9) * r, a.y + Math.sin(th - .9) * r); tx.lineTo(b.x + Math.cos(th) * r, b.y + Math.sin(th) * r); tx.stroke();
+  }
+}
+function frame(ts) { requestAnimationFrame(frame); if (document.hidden) return; T = ts / 1000; drawThreads(); drawFx(); drawTrail(ts); }
+
+const MOODS = {
+  neutral: { w: 'شبِ فرفری' }, happy: { w: 'آفتابی و طلایی', t: 'امروز می‌درخشی', d: 'انرژی‌ات به سایت هم رسید؛ امروز همه‌جا جرقه و روشنایی‌ست.' },
+  calm: { w: 'شبِ مهتابی', t: 'آرام و ساکن', d: 'دلت آرام است و سایت هم آرام شد؛ نفس‌های بلند و چراغ‌های کم‌نور.' },
+  sad: { w: 'روز بارانی', t: 'دلت ابری‌ست', d: 'اشکالی ندارد که امروز دلت بگیرد. سایت هم برای تو بارانی شد؛ لازم نیست خودت را جمع‌وجور کنی.' },
+  love: { w: 'بارانِ گلبرگ', t: 'دلت نرم و عاشقانه‌ست', d: 'امروز دلت پر از احساس است؛ سایت هم برایت دل‌هایی ریخت.' },
+  anxious: { w: 'باد و غبار', t: 'ذهنت شلوغ است', d: 'ذهن شلوغ یعنی دلت خیلی چیزها را جدی گرفته. یک نفس عمیق؛ همه‌چیز را یک‌جا لازم نیست حل کنی.' },
+  angry: { w: 'جرقه‌های سرخ', t: 'درونت آتش است', d: 'خشم هم یک پیام است، نه یک ایراد. بگذار جرقه‌ها بالا بروند و بعد خاموش شوند.' }
+};
+function applyMood(m) {
+  if (!MOODS[m]) m = 'neutral'; mood = m; document.body.dataset.mood = m; setFx(m); $('#weather').textContent = 'هوای سایت: ' + MOODS[m].w;
+  const tc = document.querySelector('meta[name=theme-color]'); setTimeout(() => { syncColors(); if (tc) tc.content = getComputedStyle(document.body).getPropertyValue('--bg1').trim() || '#17101c'; }, 80);
+  setTimeout(syncColors, 1000); setTimeout(syncColors, 2000);
+}
+
+/* ============ ورود و ثبت‌نام ============ */
+let authMode = 'login';
+function showAuth() { me = null; $('#app').classList.add('hidden'); $('#auth').classList.remove('hidden'); menu(false); closeOv(); window.scrollTo(0, 0); }
+function enterApp() { $('#auth').classList.add('hidden'); $('#app').classList.remove('hidden'); $('#menuBtn').innerHTML = ico('menu'); go('home'); }
+async function authSubmit(e) {
+  e.preventDefault(); const err = $('#aErr'), btn = $('#aBtn'); err.textContent = ''; btn.disabled = true;
+  try { const d = await api(authMode === 'login' ? '/login' : '/signup', 'POST', { name: $('#aName').value.trim(), code: $('#aCode').value.trim() }); me = ingest(d.user); applyMood(d.mood); $('#authForm').reset(); enterApp(); toast('خوش آمدی ' + dname(me)); }
+  catch (x) { err.textContent = x.message; } finally { btn.disabled = false; }
+}
+
+/* ============ قاب برنامه ============ */
+const avatar = (u, s, big, na) => {
+  u = u || { name: '؟' }; ingest(u); const c = `av ${u.admin ? 'admin' : ''} ${s ? 's' : ''} ${big ? 'big' : ''}`, at = na ? '' : ` data-act="prof" data-u="${esc(u.name)}"`;
+  if (u.avatar) return `<span class="${c}"${at}><img src="${esc(u.avatar)}" alt="" loading="lazy"></span>`;
+  if (u.admin) return `<span class="${c}"${at}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3c4 0 6 3 5 6s-5 3-5 0 3-4 5-2M12 21c-3-2-3-5 0-6"/></svg></span>`;
+  let h = 0; for (const ch of u.name) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  return `<span class="${c}" style="--h:${h}"${at}>${esc([...dname(u)][0] || '؟')}</span>`;
+};
+const NAV = [['home', 'خانه', 'home'], ['profile', 'پروفایل من', 'user'], ['mine', 'کامنت‌های من', 'chat'], ['anon', 'پیام ناشناس', 'mail'], ['quote', 'سخنان نغزِ امروز', 'spark']];
+let installEv = null; addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEv = e; });
+const standalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+function buildDrawer() {
+  if (!me) return;
+  const items = NAV.map(([v, t, i]) => `<button class="nav ${view === v ? 'on' : ''}" data-act="go" data-v="${v}">${ico(i)}${t}</button>`).join('');
+  const adm = me.admin ? `<button class="nav ${view === 'admin' ? 'on' : ''}" data-act="go" data-v="admin">${ico('shield')}مدیریت${unseenN ? `<span class="badge">${fa(unseenN)}</span>` : ''}</button>` : '';
+  const inst = standalone() ? '' : `<button class="nav" data-act="install">${ico('phone')}نصب روی گوشی</button>`;
+  $('#drawer').innerHTML = `<div class="me" data-act="go" data-v="profile">${avatar(me, 0, 0, 1)}<div><b>${esc(dname(me))}</b><small>${me.admin ? 'مدیر سایت' : 'کاربر'}</small></div></div>${items}${adm}<div class="grow"></div>${inst}<button class="nav" data-act="logout">${ico('out')}خروج</button>`;
+  let b = $('#menuBtn .badge'); if (unseenN) { if (!b) { b = document.createElement('span'); b.className = 'badge'; $('#menuBtn').appendChild(b); } b.textContent = fa(unseenN); } else if (b) b.remove();
+}
+const menu = o => { $('#drawer').classList.toggle('on', o); $('#scrim').classList.toggle('on', o); };
+async function go(v) {
+  view = v; menu(false); buildDrawer(); const m = $('#view'); m.classList.remove('in'); void m.offsetWidth; m.classList.add('in'); m.innerHTML = '';
+  try { await ({ home: vHome, mine: vMine, anon: vAnon, quote: vQuote, admin: vAdmin, profile: vProfile }[v] || vHome)(m); }
+  catch (e) { if (e.status !== 401) m.innerHTML = `<div class="empty glass">${ico('x')}<div>${esc(e.message)}</div><br><button class="btn" data-act="go" data-v="${v}">دوباره امتحان کن</button></div>`; }
+  window.scrollTo({ top: 0 });
+}
+const ov = (html, cls = '') => { const o = $('#ov'); o.className = 'ov ' + cls; o.innerHTML = html; requestAnimationFrame(() => requestAnimationFrame(() => o.classList.add('on'))); };
+const closeOv = () => $('#ov').classList.remove('on');
+
+/* ============ خانه و پست‌ها ============ */
+let posts = [], total = 0, att = [], openC = new Set();
+const sig = p => p.id + '|' + p.comments.map(c => c.id).join() + '|' + JSON.stringify(p.reactions) + '|' + p.pinned + '|' + (p.mine || '');
+async function vHome(m) {
+  const comp = me.admin ? `<div class="composer glass"><textarea class="inp" id="pText" placeholder="امروز چه خبر، فرفری؟" maxlength="2000"></textarea><div class="att" id="attPrev"></div>
+   <div class="row"><label class="btn ghost sm" style="cursor:pointer">${ico('img')}عکس، ویدیو، آهنگ یا فایل<input type="file" id="pFile" multiple hidden></label><div class="grow"></div><button class="btn" data-act="publish" id="pBtn">انتشار</button></div></div>` : '';
+  m.innerHTML = `<h2 class="view-title">${me.admin ? 'پست‌های تو' : 'سلام ' + esc(dname(me))}</h2><p class="sub">${me.admin ? 'هر چه می‌خواهی بنویس؛ همه‌چیز همین‌جا می‌ماند.' : 'قصه‌های فرفری را بخوان و زیرشان کامنت بگذار.'}</p>${comp}<div id="feed"><div class="sk"></div><div class="sk"></div></div>`;
+  if (me.admin) { $('#pFile').onchange = addFiles; att = []; drawAtt(); }
+  const d = await api('/posts?offset=0&limit=20'); posts = d.posts; total = d.total; drawFeed();
+}
+function drawFeed() {
+  const f = $('#feed'); if (!f) return;
+  f.innerHTML = posts.length ? posts.map(postHTML).join('') + (posts.length < total ? `<div style="text-align:center"><button class="btn ghost" data-act="more">نمایش بیشتر</button></div>` : '')
+    : `<div class="empty glass">${ico('heart')}<div>${me.admin ? 'هنوز پستی نگذاشته‌ای. اولین قصه را بنویس.' : 'هنوز پستی نیست. به‌زودی اولین قصه می‌آید.'}</div></div>`;
+}
+function postHTML(p) {
+  ingest(p.author); p.comments.forEach(c => ingest(c.user));
+  const open = openC.has(p.id), vis = p.media.filter(x => x.type === 'image' || x.type === 'video'), oth = p.media.filter(x => x.type === 'audio' || x.type === 'file');
+  const med = (vis.length ? `<div class="media m${Math.min(vis.length, 4)}">${vis.map(x => x.type === 'image' ? `<img src="${esc(x.url)}" alt="" loading="lazy" data-act="zoom">` : `<video src="${esc(x.url)}" controls playsinline preload="metadata"></video>`).join('')}</div>` : '')
+    + oth.map(x => x.type === 'audio' ? `<div class="aud"><div class="aud-h">${ico('music')}<span>${esc((x.name || 'آهنگ').replace(/\.[^.]+$/, ''))}</span></div><audio controls preload="none" src="${esc(x.url)}"></audio></div>` : `<a class="fcard" href="${esc(x.url)}" download>${ico('file')}<span class="grow">${esc(x.name || 'فایل')}<small>${fsize(x.size)}</small></span>${ico('down')}</a>`).join('');
+  const rx = Object.entries(p.reactions).sort((a, b) => b[1] - a[1]).map(([e, n]) => `<button class="rx ${p.mine === e ? 'me' : ''}" data-act="react" data-id="${p.id}" data-e="${e}">${e}<span>${fa(n)}</span></button>`).join('');
+  return `<article class="post glass ${p.pinned ? 'pin' : ''}" data-post="${p.id}"><div class="post-h">${avatar(p.author)}<div><b>${esc(dname(p.author))}${p.pinned ? `<span class="pinned">سنجاق‌شده</span>` : ''}</b><small>${ago(p.ts)}</small></div><div class="grow"></div>
+  ${me.admin ? `<button class="xbtn" data-act="pin" data-id="${p.id}" aria-label="سنجاق">${ico('pin')}</button><button class="xbtn" data-act="delPost" data-id="${p.id}" aria-label="حذف پست">${ico('trash')}</button>` : ''}</div>
+  ${p.text ? `<p class="post-t">${esc(p.text)}</p>` : ''}${med}${rx ? `<div class="rxs">${rx}</div>` : ''}
+  <div class="acts"><div class="tray">${['❤️', '🌀', '🥹', '😍', '🔥'].map(e => `<button data-act="react" data-id="${p.id}" data-e="${e}">${e}</button>`).join('')}</div>
+  <button class="act" data-act="tray">${ico('smile')}واکنش</button><button class="act" data-act="toggleC" data-id="${p.id}">${ico('chat')}${fa(p.comments.length)} کامنت</button></div>
+  ${open ? `<div class="cm">${p.comments.map(c => `<div class="cmi">${avatar(c.user, 1)}<div class="cmb"><b>${esc(dname(c.user))}</b><small>${ago(c.ts)}</small><p>${esc(c.text)}</p></div>${(me.admin || c.user.name === me.name) ? `<button class="xbtn" data-act="delC" data-id="${c.id}" aria-label="حذف کامنت">${ico('x')}</button>` : ''}</div>`).join('')}
+  <div class="cform"><input class="inp" data-cin="${p.id}" placeholder="کامنت بنویس…" maxlength="500" enterkeyhint="send"><button class="btn" data-act="sendC" data-id="${p.id}" aria-label="ارسال">${ico('send')}</button></div></div>` : ''}</article>`;
+}
+function setPost(p) { if (!p) return; const i = posts.findIndex(x => x.id === p.id); if (i < 0) return; posts[i] = p; rePost(p); }
+function rePost(p) { const e = document.querySelector(`[data-post="${p.id}"]`); if (e) { const t = document.createElement('div'); t.innerHTML = postHTML(p); e.replaceWith(t.firstElementChild); } }
+async function refreshFeed() {
+  if (view !== 'home' || !$('#feed')) return; const a = document.activeElement; if (a && a.closest && a.closest('#feed') && a.value) return;
+  const d = await api('/posts?offset=0&limit=' + Math.min(50, Math.max(20, posts.length))); const old = posts; posts = d.posts; total = d.total;
+  const sameIds = old.length === posts.length && old.every((p, i) => p.id === posts[i].id);
+  if (sameIds) { posts.forEach((p, i) => { if (sig(p) !== sig(old[i])) rePost(p); }); } else drawFeed();
+}
+async function shrink(f) {
+  if (f.type === 'image/gif') return f;
+  try { const b = await createImageBitmap(f), s = Math.min(1, 1800 / Math.max(b.width, b.height)), c = document.createElement('canvas'); c.width = Math.round(b.width * s); c.height = Math.round(b.height * s); c.getContext('2d').drawImage(b, 0, 0, c.width, c.height); return await new Promise(r => c.toBlob(r, 'image/jpeg', .86)) || f; } catch (e) { return f; }
+}
+async function addFiles(e) {
+  const files = [...e.target.files]; e.target.value = '';
+  for (const f of files) {
+    if (att.length >= 8) { toast('حداکثر ۸ فایل'); break; }
+    const type = f.type.startsWith('image/') ? 'image' : f.type.startsWith('video/') ? 'video' : f.type.startsWith('audio/') ? 'audio' : 'file';
+    const a = { type, name: f.name, pct: 0, id: null, preview: type === 'image' ? URL.createObjectURL(f) : null }; att.push(a); drawAtt();
+    (async () => {
+      try { const blob = type === 'image' ? await shrink(f) : f; const nm = type === 'image' && blob !== f ? f.name.replace(/\.[^.]+$/, '') + '.jpg' : f.name; const d = await upload(blob, nm, 'post', p => { a.pct = p; drawAtt(); }); a.id = d.id; a.pct = 1; }
+      catch (x) { toast(x.message); att = att.filter(y => y !== a); } drawAtt();
+    })();
+  }
+}
+function drawAtt() {
+  const e = $('#attPrev'); if (!e) return;
+  e.innerHTML = att.map((a, i) => `<div>${a.preview ? `<img src="${a.preview}" alt="">` : `<span class="ph">${ico(a.type === 'video' ? 'img' : a.type === 'audio' ? 'music' : 'file')}</span>`}${a.pct < 1 ? `<span class="pg">${fa(Math.round(a.pct * 100))}٪</span>` : ''}<button data-act="rmAtt" data-i="${i}" aria-label="حذف">${ico('x')}</button></div>`).join('');
+  const b = $('#pBtn'); if (b) b.disabled = att.some(a => a.pct < 1);
+}
+
+/* ============ کامنت‌های من ============ */
+async function vMine(m) {
+  const d = await api('/my-comments'), cs = d.comments;
+  m.innerHTML = `<h2 class="view-title">کامنت‌های من</h2><p class="sub">همه‌ی چیزهایی که زیر پست‌ها نوشته‌ای.</p>` + (cs.length ? cs.map(c => `<div class="item glass"><div class="grow"><p>${esc(c.text)}</p><small>${ago(c.ts)} · روی «${esc(c.snippet)}»</small></div><button class="xbtn" data-act="delC" data-id="${c.id}" data-r="mine" aria-label="حذف">${ico('trash')}</button></div>`).join('') : `<div class="empty glass">${ico('chat')}<div>هنوز کامنتی ننوشته‌ای.</div><br><button class="btn" data-act="go" data-v="home">برو به پست‌ها</button></div>`);
+}
+
+/* ============ پیام ناشناس ============ */
+function vAnon(m) {
+  m.innerHTML = `<h2 class="view-title">پیام ناشناس</h2><p class="sub">هر چه در دل داری بنویس. نامت همراه پیام ذخیره نمی‌شود.</p>
+  <div class="glass" style="padding:18px" id="anBox"><textarea class="inp" id="anText" maxlength="800" placeholder="پیامت را اینجا بنویس…"></textarea><div class="row" style="margin-top:12px"><small style="color:var(--mute)" id="anCnt">۰ / ۸۰۰</small><div class="grow"></div><button class="btn" data-act="anonSend">${ico('send')}ارسال</button></div></div>`;
+  $('#anText').oninput = e => $('#anCnt').textContent = fa(e.target.value.length) + ' / ' + fa(800);
+}
+
+/* ============ سخنان نغز (هر ۱۲ ساعت) ============ */
+const QCAT = { sad: { n: 'دلتنگی', c: '#8fb4ff' }, hope: { n: 'امید به عشق', c: '#9be8a8' }, love: { n: 'عاشقانه', c: '#ff8fb1' }, life: { n: 'درسِ عشق', c: '#ffd166' } };
+let lastQ = null;
+async function vQuote(m) {
+  const d = await api('/quote'); lastQ = d.last;
+  m.innerHTML = `<h2 class="view-title">سخنان نغزِ امروز</h2><p class="sub">هر ۱۲ ساعت یک جمله درباره‌ی عشق؛ از دلتنگی تا امید، از عاشقانه تا درسِ دوست داشتن.</p>
+  <div class="q-stage glass"><svg class="q-ring" viewBox="0 0 150 150" aria-hidden="true"><g><path id="ringP"/></g></svg><button class="btn q-cta" data-act="quoteAsk">${ico('spark')}جمله‌ی امروزم را بشنوم</button></div>
+  ${lastQ ? `<div class="last glass"><small>آخرین جمله‌ی تو · ${ago(lastQ.ts)}</small><p>${esc(lastQ.quote.text)}</p><small>${esc(lastQ.quote.author)}</small></div>` : ''}`;
+  let dd = ''; for (let i = 0; i <= 200; i++) { const t = i / 200 * 6.2832 * 7, r = 55 + 14 * Math.sin(t), a = i / 200 * 6.2832; dd += (i ? 'L' : 'M') + (75 + r * Math.cos(a) + 11 * Math.cos(t)).toFixed(1) + ' ' + (75 + r * Math.sin(a) + 11 * Math.sin(t)).toFixed(1); }
+  $('#ringP').setAttribute('d', dd);
+}
+const quoteAsk = () => ov(`<div class="dlg"><h3>آماده‌ای جمله‌ی امروزت را بشنوی؟</h3><p>شاید دلت را نرم کند، شاید کمی بغض بیاورد، شاید هم فقط لبخند.</p><div class="row" style="justify-content:center"><button class="btn" data-act="quoteYes">آره، آماده‌ام</button><button class="btn ghost" data-act="quoteNo">نه، هنوز نه</button></div></div>`);
+async function quoteYes() {
+  const d = await api('/quote', 'POST', {}); lastQ = { ts: d.ts, quote: d.quote };
+  const tm = Math.max(1, Math.ceil((d.nextAt - Date.now()) / 60e3)), h = Math.floor(tm / 60), mn = tm % 60, cat = QCAT[d.quote.cat] || QCAT.love; let i = 0;
+  const words = d.quote.text.split('\n').map(l => l.split(' ').map(w => `<span style="animation-delay:${(.5 + (i++) * .16).toFixed(2)}s">${esc(w)}</span>`).join(' ')).join('<br>');
+  ov(`<div class="qcard" style="--qc:${cat.c}"><div class="qin"><div class="qcat">${cat.n}</div><p class="qtext">${words}</p><div class="qauth">${esc(d.quote.author)}</div>
+   <div class="row" style="justify-content:center"><button class="btn ghost sm" data-act="quoteCopy">${ico('copy')}کپی</button><button class="btn sm" data-act="closeOv">بستن</button></div>
+   <div class="qnext">${d.fresh ? '' : 'این همان جمله‌ی امروزِ توست. '}جمله‌ی بعدی تا ${h ? fa(h) + ' ساعت' : ''}${h && mn ? ' و ' : ''}${mn || !h ? fa(mn) + ' دقیقه' : ''}ی دیگر</div></div></div>`);
+  if (view === 'quote') vQuote($('#view'));
+}
+
+/* ============ پروفایل ============ */
+let pendAv;
+async function avatarBlob(f) { const b = await createImageBitmap(f), m = Math.min(b.width, b.height), c = document.createElement('canvas'); c.width = c.height = 320; c.getContext('2d').drawImage(b, (b.width - m) / 2, (b.height - m) / 2, m, m, 0, 0, 320, 320); return new Promise(r => c.toBlob(r, 'image/jpeg', .88)); }
+function vProfile(m) {
+  pendAv = undefined;
+  m.innerHTML = `<h2 class="view-title">پروفایل من</h2><p class="sub">این چیزی‌ست که دیگران کنار پست‌ها و کامنت‌هایت می‌بینند.</p>
+  <div class="glass" style="padding:22px"><div class="row" style="gap:18px;margin-bottom:20px"><span id="pAv">${avatar(me, 0, 1, 1)}</span>
+  <div><label class="btn ghost sm" style="cursor:pointer">${ico('img')}تغییر عکس<input type="file" id="pvFile" accept="image/*" hidden></label>${me.avatar ? `<button class="btn ghost sm" data-act="avRm" style="margin-inline-start:8px">حذف عکس</button>` : ''}<div class="note">نام کاربری: <bdi>${esc(me.name)}</bdi></div></div></div>
+  <label class="field"><span>نام نمایشی</span><input class="inp" id="pvName" maxlength="20" value="${esc(me.disp)}" placeholder="${esc(me.admin ? 'فرفری' : me.name)}"></label>
+  <label class="field"><span>درباره‌ی من</span><textarea class="inp" id="pvBio" maxlength="160" placeholder="یک جمله درباره‌ی خودت…">${esc(me.bio)}</textarea></label>
+  ${me.admin ? '' : `<label class="field"><span>کد ورود جدید (اختیاری)</span><input class="inp" id="pvCode" type="password" maxlength="30" placeholder="برای تغییر کد، اینجا بنویس"></label>`}
+  <p class="err" id="pvErr"></p><button class="btn" data-act="saveProf">ذخیره</button></div>`;
+  $('#pvFile').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return; const box = $('#pAv');
+    try { const b = await avatarBlob(f); box.innerHTML = `<span class="av big"><img src="${URL.createObjectURL(b)}" alt=""></span>`; const d = await upload(b, 'avatar.jpg', 'avatar'); pendAv = d.id; toast('عکس آماده شد؛ ذخیره را بزن'); }
+    catch (x) { toast(x.message || 'این عکس خوانده نشد'); }
+  };
+}
+
+/* ============ مدیریت ============ */
+let aTab = 'comments', mq = null, moodData = null;
+async function vAdmin(m) {
+  if (!me.admin) return go('home');
+  const c = await api('/admin/counts'); unseenN = c.comments + c.anon; buildDrawer();
+  m.innerHTML = `<h2 class="view-title">مدیریت</h2><p class="sub">همه‌چیزِ سایت یک‌جا.</p><div class="tabs">
+  <button class="${aTab === 'comments' ? 'on' : ''}" data-act="aTab" data-t="comments">کامنت‌های جدید${c.comments ? `<span class="n">${fa(c.comments)}</span>` : ''}</button>
+  <button class="${aTab === 'anon' ? 'on' : ''}" data-act="aTab" data-t="anon">پیام‌های ناشناس${c.anon ? `<span class="n">${fa(c.anon)}</span>` : ''}</button>
+  <button class="${aTab === 'mood' ? 'on' : ''}" data-act="aTab" data-t="mood">امروز حالت چطوره؟</button>
+  <button class="${aTab === 'quotes' ? 'on' : ''}" data-act="aTab" data-t="quotes">جمله‌های من</button>
+  <button class="${aTab === 'stats' ? 'on' : ''}" data-act="aTab" data-t="stats">آمار و کاربران</button></div><div id="aBody"></div>`;
+  const b = $('#aBody');
+  if (aTab === 'comments') {
+    const d = await api('/admin/comments'), cs = d.comments;
+    b.innerHTML = (c.comments ? `<div class="row" style="margin-bottom:12px"><button class="btn ghost sm" data-act="seenAll" data-k="comments">همه را دیده‌شده کن</button></div>` : '') + (cs.length ? cs.map(x => `<div class="item glass ${x.seen ? '' : 'new'}">${avatar(x.user, 1)}<div class="grow"><b>${esc(dname(x.user))}</b> <small>${ago(x.ts)}</small><p>${esc(x.text)}</p><small>روی: ${esc(x.snippet)}</small></div><div class="row">${x.seen ? '' : `<button class="btn sm" data-act="seenC" data-id="${x.id}">دیدم</button>`}<button class="xbtn" data-act="delC" data-id="${x.id}" data-r="admin" aria-label="حذف">${ico('trash')}</button></div></div>`).join('') : `<div class="empty glass">${ico('chat')}<div>هنوز کامنتی نیامده.</div></div>`);
+  } else if (aTab === 'anon') {
+    const d = await api('/admin/anon'), as = d.anon;
+    b.innerHTML = (c.anon ? `<div class="row" style="margin-bottom:12px"><button class="btn ghost sm" data-act="seenAll" data-k="anon">همه را دیده‌شده کن</button></div>` : '') + (as.length ? as.map(a => `<div class="item glass ${a.seen ? '' : 'new'}">${ico('mail')}<div class="grow"><p>${esc(a.text)}</p><small>${ago(a.ts)}</small></div><div class="row">${a.seen ? '' : `<button class="btn sm" data-act="seenA" data-id="${a.id}">دیدم</button>`}<button class="xbtn" data-act="delA" data-id="${a.id}" aria-label="حذف">${ico('trash')}</button></div></div>`).join('') : `<div class="empty glass">${ico('mail')}<div>هنوز پیام ناشناسی نرسیده.</div></div>`);
+  } else if (aTab === 'mood') { moodData = await api('/admin/mood'); drawMood(b); }
+  else if (aTab === 'quotes') {
+    const d = await api('/admin/quotes');
+    b.innerHTML = `<div class="glass" style="padding:18px;margin-bottom:16px"><p class="sub" style="margin-bottom:10px">جمله‌ی خودت را اضافه کن؛ به جمله‌های امروزِ همه می‌پیوندد.</p><textarea class="inp" id="qText" maxlength="400" placeholder="یک جمله‌ی عاشقانه…"></textarea><div class="row" style="margin-top:10px"><select class="inp" id="qCat" style="width:auto">${Object.entries(QCAT).map(([k, v]) => `<option value="${k}">${v.n}</option>`).join('')}</select><input class="inp" id="qAuth" placeholder="نویسنده (اختیاری)" maxlength="40" style="flex:1;min-width:140px"><button class="btn" data-act="addQuote">افزودن</button></div></div>`
+      + (d.quotes.length ? d.quotes.map(q => `<div class="item glass"><div class="grow"><p>${esc(q.text)}</p><small>${QCAT[q.cat].n} · ${esc(q.author)}</small></div><button class="xbtn" data-act="delQ" data-id="${q.id}" aria-label="حذف">${ico('trash')}</button></div>`).join('') : `<div class="empty glass">${ico('spark')}<div>هنوز جمله‌ای اضافه نکرده‌ای.</div></div>`);
+  } else {
+    const d = await api('/admin/stats'), s = d.stats;
+    b.innerHTML = `<div class="stats">${[['کاربران', s.users], ['پست‌ها', s.posts], ['کامنت‌ها', s.comments], ['واکنش‌ها', s.reactions], ['پیام ناشناس', s.anon]].map(([t, n]) => `<div class="stat glass"><b>${fa(n)}</b><small>${t}</small></div>`).join('')}<div class="stat glass"><b>${fsize(s.bytes)}</b><small>فایل‌های آپلودشده</small></div></div>`
+      + (d.users.length ? d.users.map(u => `<div class="item glass"><div class="grow"><b>${esc(u.disp || u.name)}</b> <small>@${esc(u.name)} · عضو شده ${ago(u.created)}</small></div><button class="xbtn" data-act="delUser" data-id="${u.id}" aria-label="حذف کاربر">${ico('trash')}</button></div>`).join('') : `<div class="empty glass">${ico('user')}<div>هنوز کسی عضو نشده.</div></div>`);
+  }
+}
+function histHTML() { const h = moodData.history; return h.length ? `<div class="hist">${h.map(x => `<span class="chip">${new Date(x.date).toLocaleDateString('fa-IR', { month: 'short', day: 'numeric' })}: ${MOODS[x.mood].t}</span>`).join('')}</div>` : ''; }
+function drawMood(b) {
+  const done = moodData.done;
+  if (done && !mq) { const M = MOODS[done.mood]; b.innerHTML = `<div class="mood-card glass"><div style="font-size:.9rem;color:var(--mute)">حالِ امروز</div><div class="mq">${M.t}</div><p style="color:var(--mute);max-width:44ch;margin:0 auto 18px">${M.d}</p><span class="chip">هوای سایت: ${M.w}</span><br><br><button class="btn ghost sm" data-act="moodRestart">دوباره پاسخ می‌دهم</button>${histHTML()}</div>`; return; }
+  if (!mq) mq = { i: 0, a: [] }; const q = moodData.questions[mq.i];
+  b.innerHTML = `<div class="mood-card glass"><div class="dots">${[0, 1, 2].map(i => `<i class="${i <= mq.i ? 'on' : ''}"></i>`).join('')}</div><div class="mq">${esc(q.q)}</div><div class="opts">${q.o.map((o, i) => `<button class="opt" data-act="moodPick" data-i="${i}">${esc(o[0])}</button>`).join('')}</div>${histHTML()}</div>`;
+}
+
+/* ============ اکشن‌ها ============ */
+const A = {
+  authTab(b) { authMode = b.dataset.m; document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('on', x === b)); $('#aBtn').textContent = authMode === 'login' ? 'ورود' : 'ساخت حساب'; $('#aErr').textContent = ''; $('#aNote').textContent = authMode === 'login' ? 'ساخت حساب فقط با یک نام و یک کد ورود انجام می‌شود. کدت را فراموش نکن؛ بازیابی ندارد.' : 'یک نام و یک کد دلخواه انتخاب کن؛ همین کافی‌ست.'; },
+  eye(b) { const i = $('#aCode'); i.type = i.type === 'password' ? 'text' : 'password'; b.textContent = i.type === 'password' ? 'نمایش' : 'پنهان'; },
+  menu() { menu(true); }, menuClose() { menu(false); }, go(b) { go(b.dataset.v); },
+  async logout() { try { await api('/logout', 'POST', {}); } catch (e) { } me = null; showAuth(); },
+  async publish() {
+    const t = $('#pText').value.trim(); if (!t && !att.length) return toast('یک متن یا فایل اضافه کن'); if (att.some(a => a.pct < 1)) return toast('صبر کن تا آپلود تمام شود');
+    $('#pBtn').disabled = true; const d = await api('/posts', 'POST', { text: t, media: att.map(a => ({ id: a.id })) }); att = []; $('#pText').value = ''; drawAtt(); posts.unshift(d.post); total++; drawFeed(); toast('منتشر شد');
+  },
+  rmAtt(b) { att.splice(+b.dataset.i, 1); drawAtt(); },
+  more: async () => { const d = await api('/posts?offset=' + posts.length + '&limit=20'); posts = posts.concat(d.posts); total = d.total; drawFeed(); },
+  tray(b) { const t = b.parentElement.querySelector('.tray'); const was = t.classList.contains('on'); document.querySelectorAll('.tray.on').forEach(x => x.classList.remove('on')); if (!was) t.classList.add('on'); },
+  async react(b) { const d = await api(`/posts/${b.dataset.id}/react`, 'POST', { emoji: b.dataset.e }); setPost(d.post); },
+  toggleC(b) { const id = b.dataset.id; openC.has(id) ? openC.delete(id) : openC.add(id); const p = posts.find(p => p.id === id); if (p) rePost(p); },
+  async sendC(b) { const id = b.dataset.id, i = document.querySelector(`[data-cin="${id}"]`), t = i.value.trim(); if (!t) return; b.disabled = true; const d = await api(`/posts/${id}/comments`, 'POST', { text: t }); setPost(d.post); document.querySelector(`[data-cin="${id}"]`)?.focus(); },
+  async delC(b) {
+    const d = await api('/comments/' + b.dataset.id, 'DELETE');
+    if (b.dataset.r === 'mine') go('mine'); else if (b.dataset.r === 'admin') go('admin'); else setPost(d.post);
+  },
+  async pin(b) { const d = await api(`/posts/${b.dataset.id}/pin`, 'POST', {}); await refreshAll(); toast(d.post.pinned ? 'سنجاق شد' : 'از سنجاق درآمد'); },
+  async delPost(b) { if (!confirm('این پست و کامنت‌هایش حذف شود؟')) return; await api('/posts/' + b.dataset.id, 'DELETE'); posts = posts.filter(p => p.id !== b.dataset.id); total--; drawFeed(); toast('حذف شد'); },
+  zoom(b) { ov(`<div class="zoom" data-act="closeOv"><img src="${esc(b.src)}" alt=""></div>`); },
+  closeOv, 
+  async anonSend() { const t = $('#anText').value.trim(); if (t.length < 2) return toast('یک پیام بنویس'); await api('/anon', 'POST', { text: t }); $('#anBox').innerHTML = `<div class="empty"><div class="paper">${ico('send').replace('class="i "', 'class="i" style="width:56px;height:56px"')}</div><p style="margin-top:14px">پیامت بی‌نام و نشان رسید.</p><button class="btn ghost sm" data-act="go" data-v="anon">پیام دیگر</button></div>`; },
+  aTab(b) { aTab = b.dataset.t; go('admin'); },
+  async seenC(b) { await api('/admin/seen', 'POST', { kind: 'comments', id: b.dataset.id }); go('admin'); },
+  async seenA(b) { await api('/admin/seen', 'POST', { kind: 'anon', id: b.dataset.id }); go('admin'); },
+  async delA(b) { await api('/admin/anon/' + b.dataset.id, 'DELETE'); go('admin'); },
+  async seenAll(b) { await api('/admin/seen', 'POST', { kind: b.dataset.k, all: true }); go('admin'); },
+  async moodPick(b) {
+    const q = moodData.questions[mq.i]; mq.a.push(q.o[+b.dataset.i][1]);
+    if (mq.i < 2) { mq.i++; drawMood($('#aBody')); return; }
+    const d = await api('/admin/mood', 'POST', { answers: mq.a }); mq = null; applyMood(d.mood); moodData = await api('/admin/mood'); drawMood($('#aBody')); toast('ظاهر سایت با حالت امروزت هماهنگ شد');
+  },
+  moodRestart() { mq = { i: 0, a: [] }; drawMood($('#aBody')); },
+  async addQuote() { const t = $('#qText').value.trim(); await api('/admin/quotes', 'POST', { text: t, cat: $('#qCat').value, author: $('#qAuth').value.trim() }); toast('اضافه شد'); go('admin'); },
+  async delQ(b) { await api('/admin/quotes/' + b.dataset.id, 'DELETE'); go('admin'); },
+  async delUser(b) { if (!confirm('این کاربر و کامنت‌هایش حذف شود؟')) return; await api('/admin/users/' + b.dataset.id, 'DELETE'); go('admin'); },
+  quoteAsk, quoteYes, quoteNo() { closeOv(); toast('هر وقت آماده بودی، من اینجا هستم'); },
+  quoteCopy() { if (lastQ) navigator.clipboard?.writeText(lastQ.quote.text + ' — ' + lastQ.quote.author).then(() => toast('کپی شد'), () => { }); },
+  prof(b) { const u = U[b.dataset.u]; if (!u) return; ov(`<div class="dlg"><div style="display:grid;place-items:center;margin-bottom:12px">${avatar(u, 0, 1, 1)}</div><h3>${esc(dname(u))}</h3><p>${esc(u.bio || (u.admin ? 'صاحبِ این خانه‌ی فرفری' : 'عضوِ خانواده‌ی فرفری'))}</p><button class="btn ghost sm" data-act="closeOv">بستن</button></div>`); },
+  async avRm() { const d = await api('/me', 'PUT', { disp: me.disp, bio: me.bio, avatar: null }); me = ingest(d.user); buildDrawer(); go('profile'); },
+  async saveProf() {
+    const err = $('#pvErr'); err.textContent = ''; const body = { disp: $('#pvName').value.trim(), bio: $('#pvBio').value.trim() };
+    if (pendAv) body.avatar = pendAv; if ($('#pvCode') && $('#pvCode').value.trim()) body.code = $('#pvCode').value.trim();
+    try { const d = await api('/me', 'PUT', body); me = ingest(d.user); buildDrawer(); toast('پروفایل ذخیره شد'); go('profile'); } catch (x) { err.textContent = x.message; }
+  },
+  async install() {
+    if (installEv) { installEv.prompt(); installEv = null; return; }
+    menu(false); ov(`<div class="dlg"><h3>نصب روی گوشی</h3><p>سایت مثل یک اپ روی صفحه‌ی اصلی می‌نشیند.</p><ol><li>در سافاری، دکمه‌ی «اشتراک‌گذاری» (مربعِ فلش‌دار) را بزن.</li><li>«Add to Home Screen» را انتخاب کن.</li><li>«Add» را بزن.</li></ol><p style="font-size:.85rem">در اندروید: منوی مرورگر ← «نصب برنامه».</p><button class="btn" data-act="closeOv">فهمیدم</button></div>`);
+  }
+};
+async function refreshAll() { const d = await api('/posts?offset=0&limit=' + Math.min(50, Math.max(20, posts.length))); posts = d.posts; total = d.total; drawFeed(); }
+document.addEventListener('click', async e => {
+  if (!e.target.closest('.acts')) document.querySelectorAll('.tray.on').forEach(x => x.classList.remove('on'));
+  const b = e.target.closest('[data-act]'); if (!b || !A[b.dataset.act]) return;
+  if (b.dataset.act === 'closeOv' && e.target.closest('.qcard') && !e.target.closest('button')) return;
+  try { await A[b.dataset.act](b, e); } catch (x) { if (x.status !== 401) toast(x.message || 'خطایی رخ داد'); }
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { menu(false); closeOv(); } if (e.key === 'Enter' && e.target.dataset && e.target.dataset.cin) { e.preventDefault(); A.sendC({ dataset: { id: e.target.dataset.cin }, disabled: false }).catch(x => toast(x.message)); } });
+$('#ov').addEventListener('click', e => { if (e.target.id === 'ov') closeOv(); });
+$('#authForm').addEventListener('submit', authSubmit);
+
+/* ============ به‌روزرسانی زنده ============ */
+async function ping() {
+  if (!me || document.hidden) return;
+  try {
+    const d = await api('/ping'); if (d.mood !== mood) applyMood(d.mood);
+    if (d.unseen) { const n = d.unseen.comments + d.unseen.anon; if (n !== unseenN) { unseenN = n; buildDrawer(); } }
+    if (d.ver !== ver) { ver = d.ver; refreshFeed().catch(() => { }); }
+  } catch (e) { }
+}
+setInterval(ping, 20000); document.addEventListener('visibilitychange', () => { if (!document.hidden) ping(); });
+
+/* ============ شروع ============ */
+(async () => {
+  $('#heroPath').setAttribute('d', curlD(320, 4.5, 26, 56));
+  build(); addEventListener('resize', () => { build(); setFx(fxType); });
+  setFx('neutral'); syncColors(); thCol = [...thTarget]; thCol2 = [...thTarget2];
+  if (RM) { drawThreads(); drawFx(); } else requestAnimationFrame(frame);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => { });
+  try { const d = await api('/me'); ver = d.ver; applyMood(d.mood); if (d.user) { me = ingest(d.user); enterApp(); } else showAuth(); }
+  catch (e) { showAuth(); $('#aErr').textContent = e.message; }
+})();
